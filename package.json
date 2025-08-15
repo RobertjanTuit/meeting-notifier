@@ -1,0 +1,33 @@
+{
+  "name": "meeting-notifier",
+  "version": "1.0.0",
+  "description": "A Node.js app that connects to Google Calendar and controls Elgato lights for meeting notifications",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "dotenv": "^16.3.1",
+    "elgato-light-api": "^1.0.6",
+    "express": "^5.1.0",
+    "googleapis": "^126.0.1",
+    "moment": "^2.29.4",
+    "node-cron": "^3.0.3",
+    "node-fetch": "^2.7.0",
+    "open": "^10.1.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "google-calendar",
+    "elgato",
+    "meeting",
+    "notifications",
+    "lights"
+  ],
+  "author": "",
+  "license": "MIT"
+}
