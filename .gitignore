@@ -10,11 +10,17 @@ yarn-error.log*
 # Google OAuth credentials
 credentials.json
 
+# electron-builder output
+dist/
+
 # Runtime data
 pids
 *.pid
 *.seed
 *.pid.lock
+
+# Calendar event dump written at runtime (contains private meeting data)
+events-log.json
 
 # Logs
 logs

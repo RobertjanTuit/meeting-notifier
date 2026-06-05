@@ -2,6 +2,8 @@
 
 A Node.js terminal application that connects to your Google Calendar and controls Elgato lights to notify you of upcoming meetings.
 
+Cross-platform: works on **macOS**, **Windows**, and **Linux**.
+
 ## Features
 
 - 🗓️ Connects to Google Calendar API
@@ -68,17 +70,73 @@ This will create a `credentials.json` file with your authentication tokens.
 
 ## Usage
 
-Start the meeting notifier:
+You can run Meeting Notifier in two ways:
+
+### CLI / terminal mode
 
 ```bash
 npm start
 ```
 
-Or for development with auto-restart:
+Or with auto-restart for development:
 
 ```bash
 npm run dev
 ```
+
+### macOS menu bar mode
+
+A small Electron-based menu bar (top of the screen) app that wraps the same logic.
+
+Run it directly during development:
+
+```bash
+npm run tray
+```
+
+Or build a real `.app` bundle you can drag to `/Applications`:
+
+```bash
+# 1. .app only (faster, used for local install)
+npm run dist:mac-dir
+open "dist/mac-arm64/Meeting Notifier.app"
+
+# 2. signed .dmg installer
+npm run dist:mac
+open dist/*.dmg
+```
+
+The menu bar app:
+
+- Shows a calendar icon in the menu bar with a small status label (`5m`, `now`, `In meeting`, …)
+- Click the icon to see the next meeting, open or copy its link, refresh the calendar, do a test blink, flash the screen, view the events log, or toggle "Launch at login"
+- Hides the dock icon — it lives only in the menu bar
+- Works on Apple Silicon and Intel Macs
+
+#### Screen flash
+
+In addition to the Elgato lights, the menu bar app flashes the **whole screen** white at each
+notification moment (1 flash at 5 min, 2 at 1 min, 5 at start). It uses a borderless,
+click-through, always-on-top overlay on every connected display, and shows even over
+fullscreen apps (e.g. a fullscreen Zoom window). Use **Test screen flash** in the menu to preview it.
+
+Screen flashing is only available in the menu bar app (it needs a GUI) — the plain `npm start`
+terminal mode only controls the Elgato lights.
+
+#### Config locations
+
+When run via `npm run tray` (development), `.env` and `credentials.json` live in the project folder.
+
+When run from the bundled `.app`, the app reads them from a fixed location:
+
+```
+~/Library/Application Support/meeting-notifier/
+  ├── .env
+  ├── credentials.json
+  └── events-log.json     (written by the app)
+```
+
+There's an "Open config folder" item in the menu bar dropdown (and the console window's first-run dialog) to reveal it. To set it up, copy your project `.env` and `credentials.json` into that folder. If credentials are missing, the app will start the one-time Google sign-in automatically on launch.
 
 The application will:
 - 🚀 Start and connect to both Google Calendar and Elgato lights
@@ -128,9 +186,16 @@ To use a custom notification sound:
 - Ensure the lights are powered on and connected to WiFi
 
 ### Sound Issues
-- The app will try to play system sounds automatically
-- For custom sounds, place a `ding.wav` file in the `sounds/` directory
-- If no sound plays, the app will fall back to console beep
+- A `sounds/ding.wav` file is included and played on each notification
+- macOS uses `afplay` (built in)
+- Windows uses PowerShell's `System.Media.SoundPlayer`
+- Linux uses `paplay` (PulseAudio) or falls back to `aplay` (ALSA) — install one if neither is available
+
+### Zoom Detection
+The app turns on your Elgato lights automatically while a Zoom meeting is active:
+- macOS: detects the `CptHost` process (only running during an active meeting)
+- Windows: looks for a window titled like `*zoom meeting*`
+- Linux: best-effort match on a `zoom` process via `pgrep -f`
 
 ### General Issues
 - Check that all environment variables are set correctly

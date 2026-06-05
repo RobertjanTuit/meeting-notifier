@@ -2,10 +2,16 @@
   "name": "meeting-notifier",
   "version": "1.0.0",
   "description": "A Node.js app that connects to Google Calendar and controls Elgato lights for meeting notifications",
-  "main": "index.js",
+  "main": "tray.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "tray": "electron tray.js",
+    "dist:mac": "electron-builder --mac",
+    "dist:mac-dir": "electron-builder --mac --dir"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "chalk": "^4.1.2",
@@ -15,11 +21,52 @@
     "googleapis": "^126.0.1",
     "moment": "^2.29.4",
     "node-cron": "^3.0.3",
-    "node-fetch": "^2.7.0",
     "open": "^10.1.2"
   },
   "devDependencies": {
+    "electron": "^42.0.0",
+    "electron-builder": "^26.8.1",
     "nodemon": "^3.0.2"
+  },
+  "build": {
+    "appId": "com.rjtuit.meetingnotifier",
+    "productName": "Meeting Notifier",
+    "files": [
+      "tray.js",
+      "index.js",
+      "setup-auth.js",
+      "assets/**/*",
+      "sounds/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "sounds/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": ".env.example",
+        "to": ".env.example"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["arm64", "x64"]
+        }
+      ],
+      "extendInfo": {
+        "NSAppleEventsUsageDescription": "Meeting Notifier opens meeting links in your browser.",
+        "NSLocalNetworkUsageDescription": "Meeting Notifier controls Elgato lights on your local network."
+      },
+      "icon": "assets/icon.png"
+    },
+    "extends": null,
+    "directories": {
+      "output": "dist"
+    }
   },
   "keywords": [
     "google-calendar",
