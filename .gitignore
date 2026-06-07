@@ -22,6 +22,12 @@ pids
 # Calendar event dump written at runtime (contains private meeting data)
 events-log.json
 
+# Per-calendar config (contains your calendar IDs/emails); see calendars.example.json
+calendars.json
+
+# Runtime UI settings (push toggle, etc.)
+settings.json
+
 # Logs
 logs
 *.log
