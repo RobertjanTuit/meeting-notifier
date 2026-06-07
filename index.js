@@ -18,6 +18,14 @@ const execAsync = promisify(exec);
 const BLINK_BRIGHTNESS = 45;
 const BLINK_TEMPERATURE = 320;
 
+// Default per-calendar behavior. Override per calendar in calendars.json.
+const DEFAULT_CALENDAR_CONFIG = {
+    notify: true,        // schedule the pre-meeting blink/sound/screen alerts
+    autoOpen: true,      // auto-open the meeting link when it starts
+    warnNoLink: true,    // ding when a meeting has no detectable video link
+    push: true,          // send HA phone push when away from the Mac
+};
+
 let openModulePromise;
 function loadOpen() {
     if (!openModulePromise) {
@@ -309,6 +317,27 @@ class MeetingNotifier extends EventEmitter {
         return ids.length ? ids : ['primary'];
     }
 
+    /**
+     * Per-calendar behavior overrides, read from calendars.json in the config
+     * dir (cached, reloaded when the file changes). Returns defaults merged with
+     * any overrides for the given calendar id.
+     */
+    getCalendarConfig(calendarId) {
+        const configPath = path.join(this.dataDir, 'calendars.json');
+        try {
+            const stat = fs.statSync(configPath);
+            if (!this._calCfgCache || this._calCfgMtime !== stat.mtimeMs) {
+                this._calCfgCache = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                this._calCfgMtime = stat.mtimeMs;
+                console.log(chalk.gray(`⚙️  Loaded per-calendar config from ${configPath}`));
+            }
+        } catch {
+            this._calCfgCache = this._calCfgCache || {};
+        }
+        const overrides = (calendarId && this._calCfgCache[calendarId]) || {};
+        return { ...DEFAULT_CALENDAR_CONFIG, ...overrides };
+    }
+
     async getNextMeeting() {
         if (!this.calendar) {
             throw new Error('Google Calendar not initialized');
@@ -589,6 +618,12 @@ class MeetingNotifier extends EventEmitter {
     scheduleNotifications(meeting) {
         this.clearScheduledNotifications();
 
+        const cfg = this.getCalendarConfig(meeting._calendarId);
+        if (!cfg.notify) {
+            this.scheduleLog(chalk.gray(`🔕 Notifications disabled for this calendar — "${meeting.summary}" tracked but silent`));
+            return;
+        }
+
         this.resolveVideoEntryPoint(meeting);
         if (meeting.videoEntryPoint) {
             console.log(chalk.green(`🔗 Meeting link: ${meeting.videoEntryPoint.uri}`));
@@ -632,7 +667,7 @@ class MeetingNotifier extends EventEmitter {
         const task3 = cron.schedule(cronTime, async () => {
             console.log(chalk.red('🔔 Meeting starting now!'));
             await this.blinkLight(5, 1000);
-            this.openMeetingVideo(meeting);
+            if (cfg.autoOpen) this.openMeetingVideo(meeting);
             this.emit('notification', { kind: 'start', meeting });
         }, { scheduled: false });
 
@@ -640,11 +675,14 @@ class MeetingNotifier extends EventEmitter {
         this.scheduledNotifications.push(task3);
         this.scheduleLog(chalk.blue(`⏱ Scheduled 5 blinks at ${meetingTime.format('h:mm:ss a')}`));
         if (meeting.videoEntryPoint) {
-            this.scheduleLog(chalk.blue(`⏱ Scheduled open meeting video: ${meeting.videoEntryPoint.uri} at ${meetingTime.format('h:mm:ss a')}`));
-        } else {
+            if (cfg.autoOpen) {
+                this.scheduleLog(chalk.blue(`⏱ Scheduled open meeting video: ${meeting.videoEntryPoint.uri} at ${meetingTime.format('h:mm:ss a')}`));
+            }
+        } else if (cfg.warnNoLink) {
             this.scheduleLog(chalk.red(`⏱ No video entry point found for meeting: ${meeting.summary}`));
-            this.scheduleLog(chalk.red(JSON.stringify(meeting, null, 2)));
             this.playDingSound();
+        } else {
+            this.scheduleLog(chalk.gray(`⏱ No video link for "${meeting.summary}" (warning disabled for this calendar)`));
         }
     }
 

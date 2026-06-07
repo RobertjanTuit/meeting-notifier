@@ -7,6 +7,7 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "tray": "electron tray.js",
+    "test-push": "node test-push.js",
     "dist:mac": "electron-builder --mac",
     "dist:mac-dir": "electron-builder --mac --dir"
   },
@@ -29,11 +30,13 @@
     "nodemon": "^3.0.2"
   },
   "build": {
-    "appId": "com.rjtuit.meetingnotifier",
+    "appId": "com.rjtuit.meeting-notifier.v2",
     "productName": "Meeting Notifier",
     "files": [
       "tray.js",
       "index.js",
+      "push.js",
+      "audio-fix.js",
       "setup-auth.js",
       "assets/**/*",
       "sounds/**/*",
@@ -41,7 +44,9 @@
       "package.json"
     ],
     "asarUnpack": [
-      "sounds/**/*"
+      "sounds/**/*",
+      "assets/tray*.png",
+      "assets/hud.html"
     ],
     "extraResources": [
       {

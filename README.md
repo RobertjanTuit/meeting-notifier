@@ -15,6 +15,7 @@ Cross-platform: works on **macOS**, **Windows**, and **Linux**.
 - 🔄 Automatically checks for meeting updates every 5 minutes
 - 🎨 Beautiful colored terminal output
 - 🔔 Plays ding sound notification with light blinking
+- 📱 Optional phone push via Home Assistant when away from the Mac (Android companion app, DnD-bypassing)
 
 ## Prerequisites
 
@@ -109,7 +110,7 @@ open dist/*.dmg
 The menu bar app:
 
 - Shows a calendar icon in the menu bar with a small status label (`5m`, `now`, `In meeting`, …)
-- Click the icon to see the next meeting, open or copy its link, refresh the calendar, do a test blink, flash the screen, view the events log, or toggle "Launch at login"
+- Click the icon to see the next meeting, open or copy its link, refresh the calendar, do a test blink, flash the screen, test phone push, view the events log, toggle "Push to phone when away", or toggle "Launch at login"
 - Hides the dock icon — it lives only in the menu bar
 - Works on Apple Silicon and Intel Macs
 
@@ -133,6 +134,8 @@ When run from the bundled `.app`, the app reads them from a fixed location:
 ~/Library/Application Support/meeting-notifier/
   ├── .env
   ├── credentials.json
+  ├── calendars.json      (optional per-calendar overrides)
+  ├── settings.json       (runtime UI settings, e.g. push toggle)
   └── events-log.json     (written by the app)
 ```
 
@@ -156,6 +159,49 @@ The application will:
 - `ELGATO_KEY_LIGHTS`: Comma-separated list of Elgato light IP addresses
 - `CALENDAR_ID`: Google Calendar ID to monitor (default: 'primary')
 - `TIMEZONE`: Your timezone (default: 'America/New_York')
+- `HA_URL`: Externally reachable Home Assistant URL (e.g. Nabu Casa `https://xxxx.ui.nabu.casa`)
+- `HA_TOKEN`: Long-lived access token from HA Profile → Security → Long-Lived Access Tokens
+- `HA_NOTIFY_TARGET`: Notify service for your phone (e.g. `mobile_app_pixel_8` — find in HA Developer Tools → Services or Settings → Devices → your phone)
+- `PUSH_AWAY_THRESHOLD_SECONDS`: Mac idle seconds before phone push is allowed (default: `300`)
+
+### Phone push via Home Assistant
+
+When you're away from the Mac (screen locked or idle for the threshold above), the menu bar app can mirror meeting alerts to your Android phone through the [Home Assistant companion app](https://companion.home-assistant.io/).
+
+**Setup:**
+
+1. Add `HA_URL`, `HA_TOKEN`, and `HA_NOTIFY_TARGET` to `.env` (use your **externally reachable** HA URL — Nabu Casa or a reverse proxy — not `homeassistant.local`).
+2. Create a long-lived token in Home Assistant: Profile → Security → Long-Lived Access Tokens.
+3. Find your notify target: Developer Tools → Services → `notify.mobile_app_…`, or Settings → Devices → your phone → look for the notify entity name.
+4. In the tray menu, ensure **Push to phone when away** is checked (default on; persisted in `settings.json`).
+5. On Android, open the HA companion app → Notifications → find the **Meeting Reminders** channel and enable **Override Do Not Disturb** (one-time, per-channel). Urgent alerts use TTS + `alarm_stream_max` by default (or `alarm_stream` if `PUSH_URGENT_MODE=alarm_stream`).
+
+**Dismiss from your phone (optional):** Urgent phone notifications include a **Dismiss** button. Tapping it silences the Mac's blinking overdue alert even when you're away. One-time HA setup:
+
+1. Create helper **Toggle** → entity `input_boolean.meeting_notifier_dismiss` (or copy `ha/meeting-notifier-dismiss.yaml` into your HA `packages/` folder).
+2. Create automation: trigger **Event** `mobile_app_notification_action` with `action: MN_DISMISS` → action **Turn on** that helper. See `ha/meeting-notifier-dismiss.yaml` for the full YAML.
+3. Optional in `.env`: `HA_DISMISS_ENTITY=input_boolean.meeting_notifier_dismiss` (this is the default).
+
+The Mac polls that helper every 3 seconds while an overdue alert is active.
+
+**Urgency:**
+
+| Alert | HA delivery |
+|-------|-------------|
+| 5 min / 1 min reminder | `Meeting Reminders` channel, high importance |
+| Meeting start + overdue nag | TTS + `alarm_stream_max` (default), with Dismiss / Open buttons |
+
+**Per-calendar:** In `calendars.json`, set `"push": false` on a calendar to skip phone push while keeping desktop alerts. See `calendars.example.json`.
+
+**Test:**
+
+```bash
+npm run test-push              # gentle + urgent test pushes
+npm run test-push -- --gentle-only
+npm run test-push -- --urgent-only
+```
+
+Or use **Test phone push** items in the menu bar dropdown (bypasses away detection).
 
 ### Notification Timing
 

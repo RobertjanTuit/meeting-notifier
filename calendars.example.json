@@ -1,0 +1,12 @@
+{
+  "_comment": "Per-calendar behavior overrides. Keys are calendar IDs (same as in CALENDAR_ID). Any option you omit falls back to the default shown below. Copy this file to calendars.json (next to .env) and edit.",
+  "_defaults": {
+    "notify": true,
+    "autoOpen": true,
+    "warnNoLink": true,
+    "push": true
+  },
+  "robertjan.tuit@gmail.com": {
+    "warnNoLink": false
+  }
+}

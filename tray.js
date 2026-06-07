@@ -1,8 +1,17 @@
 const path = require('path');
 const fs = require('fs');
 const util = require('util');
-const { app, Tray, Menu, shell, nativeImage, clipboard, dialog, screen, BrowserWindow, ipcMain } = require('electron');
+const { app, Tray, Menu, shell, nativeImage, clipboard, dialog, screen, BrowserWindow, ipcMain, powerMonitor, Notification } = require('electron');
 const moment = require('moment');
+const {
+    sendHaPush,
+    clearHaPhoneAlert,
+    isHaDismissRequested,
+    acknowledgeHaDismiss,
+    isConfigured: haPushConfigured,
+    dismissEntityId,
+} = require('./push.js');
+const { fixAudio } = require('./audio-fix.js');
 
 let tray = null;
 let notifier = null;
@@ -10,13 +19,187 @@ let flashWindows = null;
 let isFlashing = false;
 let trayPaths = null;
 let logWindow = null;
+let hudWindow = null;
 let isQuitting = false;
+let menuIsOpen = false;
+let pendingMenuRebuild = false;
+let lastTrayTitle = null;
+let lastDockBadge = null;
+let lastMenuSignature = null;
+let dockShown = false;
+let hudUserPosition = null;
+let cachedAppMenu = null;
 const logBuffer = [];
 
 // Screen flash appearance: a soft, warm yellow that's easy on the eyes.
 const FLASH_COLOR = '#FFD980';
 const FLASH_OPACITY = 0.4;
-const alert = { active: false, meeting: null, blinkOn: false, timer: null, nagTimer: null };
+const alert = { active: false, meeting: null, blinkOn: false, timer: null, nagTimer: null, browserTimer: null, dismissPollTimer: null };
+let dismissEntityMissing = false;
+
+// Phone push: away detection + persisted toggle.
+let screenLocked = false;
+let pushEnabled = true;
+let menuBarTitle = false;
+/** 'text' = ● in menu bar (most visible); 'dot' = tiny icon; 'ring' = colorful ring */
+let trayIconStyle = 'text';
+/** Floating pill under the menu bar — reliable on macOS 26 when Control Center hides the tray */
+let showFloatingHud = true;
+let settingsPath = null;
+
+function loadSettings(dataDir) {
+    settingsPath = path.join(dataDir, 'settings.json');
+    try {
+        const raw = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+        if (typeof raw.pushEnabled === 'boolean') pushEnabled = raw.pushEnabled;
+        if (typeof raw.menuBarTitle === 'boolean') menuBarTitle = raw.menuBarTitle;
+        if (typeof raw.showFloatingHud === 'boolean') showFloatingHud = raw.showFloatingHud;
+        if (raw.trayIconStyle === 'text' || raw.trayIconStyle === 'dot' || raw.trayIconStyle === 'ring') {
+            trayIconStyle = raw.trayIconStyle;
+        }
+        if (Number.isFinite(raw.hudX) && Number.isFinite(raw.hudY)) {
+            hudUserPosition = { x: raw.hudX, y: raw.hudY };
+        }
+    } catch {
+        // first run — defaults apply
+    }
+}
+
+function saveSettings() {
+    if (!settingsPath) return;
+    try {
+        const data = { pushEnabled, menuBarTitle, trayIconStyle, showFloatingHud };
+        if (hudUserPosition) {
+            data.hudX = hudUserPosition.x;
+            data.hudY = hudUserPosition.y;
+        }
+        fs.writeFileSync(settingsPath, JSON.stringify(data, null, 2));
+    } catch (err) {
+        console.error('Failed to save settings:', err.message);
+    }
+}
+
+function awayThresholdSeconds() {
+    const n = Number(process.env.PUSH_AWAY_THRESHOLD_SECONDS);
+    return Number.isFinite(n) && n > 0 ? n : 300;
+}
+
+function isAwayFromMac() {
+    if (screenLocked) return true;
+    try {
+        return powerMonitor.getSystemIdleTime() >= awayThresholdSeconds();
+    } catch {
+        return false;
+    }
+}
+
+function shouldPushForMeeting(meeting) {
+    if (!pushEnabled || !haPushConfigured()) return false;
+    if (!isAwayFromMac()) return false;
+    if (!meeting) return true;
+    const cfg = notifier?.getCalendarConfig?.(meeting._calendarId);
+    return cfg?.push !== false;
+}
+
+/** True when you've already joined (Zoom active or meeting URL open in a browser). */
+async function isAlreadyInMeeting(meeting) {
+    if (notifier?.zoomIsRunning) return true;
+    const uri = meeting?.videoEntryPoint?.uri;
+    if (uri && await isMeetingOpenInBrowser(uri)) return true;
+    return false;
+}
+
+async function maybePushToPhone({ title, message, urgent = false, meeting }) {
+    if (!shouldPushForMeeting(meeting)) return;
+    if (await isAlreadyInMeeting(meeting)) {
+        console.log('📱 Phone push skipped — already in the meeting');
+        return;
+    }
+    const url = meeting?.videoEntryPoint?.uri;
+    await sendHaPush({ title, message, urgent, url });
+}
+
+function pushTextForKind(kind, meeting) {
+    const name = meeting?.summary || 'Meeting';
+    switch (kind) {
+        case '5min':
+            return { title: 'Meeting in 5 minutes', message: name, urgent: false };
+        case '1min':
+            return { title: 'Meeting in 1 minute', message: name, urgent: false };
+        case 'start':
+            return { title: 'Meeting started', message: name, urgent: true };
+        case 'nag':
+            return { title: 'Meeting started — join now', message: name, urgent: true };
+        default:
+            return { title: 'Meeting reminder', message: name, urgent: false };
+    }
+}
+
+function initPresenceTracking() {
+    powerMonitor.on('lock-screen', () => { screenLocked = true; });
+    powerMonitor.on('unlock-screen', () => { screenLocked = false; });
+    powerMonitor.on('suspend', () => { screenLocked = true; });
+    powerMonitor.on('resume', () => { screenLocked = false; });
+}
+
+// Browsers we know how to read tabs from. `proc` is the exact process name used
+// to detect if it's running (so we never launch a closed browser); `app` is the
+// AppleScript application name.
+const SUPPORTED_BROWSERS = [
+    { proc: 'Google Chrome', app: 'Google Chrome' },
+    { proc: 'Arc', app: 'Arc' },
+    { proc: 'Microsoft Edge', app: 'Microsoft Edge' },
+    { proc: 'Brave Browser', app: 'Brave Browser' },
+    { proc: 'Vivaldi', app: 'Vivaldi' },
+    { proc: 'Safari', app: 'Safari' },
+];
+
+function _isProcRunning(proc) {
+    return new Promise((resolve) => {
+        require('child_process').execFile('pgrep', ['-x', proc], (err, out) => {
+            resolve(!err && !!out.trim());
+        });
+    });
+}
+
+function _browserTabUrls(appName) {
+    return new Promise((resolve) => {
+        // Same Apple event works for Chromium-family and Safari. Newlines as a
+        // delimiter avoid issues with commas in URLs. Timeout so a pending
+        // Automation-permission prompt can't hang the app.
+        const script =
+            `set AppleScript's text item delimiters to linefeed\n` +
+            `tell application "${appName}" to get (URL of every tab of every window)`;
+        require('child_process').execFile('osascript', ['-e', script], { timeout: 4000 }, (err, stdout) => {
+            if (err || !stdout) return resolve([]);
+            resolve(stdout.split(/[\n,]/).map((s) => s.trim()).filter(Boolean));
+        });
+    });
+}
+
+// Read open tab URLs from running browsers (macOS). Only queries browsers that
+// are already running. Requires Automation permission per browser (prompted once).
+async function getOpenBrowserUrls() {
+    if (process.platform !== 'darwin') return [];
+    const all = [];
+    for (const b of SUPPORTED_BROWSERS) {
+        if (await _isProcRunning(b.proc)) {
+            all.push(...(await _browserTabUrls(b.app)));
+        }
+    }
+    return all;
+}
+
+function normalizeUrl(u) {
+    return String(u).replace(/^https?:\/\//, '').replace(/[?#].*$/, '').replace(/\/+$/, '').toLowerCase();
+}
+
+async function isMeetingOpenInBrowser(meetingUrl) {
+    const target = normalizeUrl(meetingUrl);
+    if (!target || target.length < 8) return false;
+    const urls = await getOpenBrowserUrls();
+    return urls.some((u) => normalizeUrl(u).includes(target));
+}
 
 // Mirror all console output into an in-app buffer (and the console window, if
 // open) so the app can be run from the Dock without a terminal and still show
@@ -267,14 +450,224 @@ function resolvePaths() {
     };
 }
 
-function buildTrayImage() {
-    const iconPath = path.join(__dirname, 'assets', 'trayTemplate.png');
-    if (fs.existsSync(iconPath)) {
-        const img = nativeImage.createFromPath(iconPath);
-        img.setTemplateImage(true);
-        return img;
+function resolveAssetPath(filename) {
+    if (app.isPackaged) {
+        const unpacked = path.join(process.resourcesPath, 'app.asar.unpacked', 'assets', filename);
+        if (fs.existsSync(unpacked)) return unpacked;
     }
-    return nativeImage.createEmpty();
+    return path.join(__dirname, 'assets', filename);
+}
+
+function loadTrayNativeImage(filename, { template = false } = {}) {
+    const assetPath = resolveAssetPath(filename);
+    if (!fs.existsSync(assetPath)) return nativeImage.createEmpty();
+
+    // Buffer load is more reliable than createFromPath for asar/unpacked assets.
+    let img = nativeImage.createFromBuffer(fs.readFileSync(assetPath));
+    if (img.isEmpty()) return img;
+    if (template) img.setTemplateImage(true);
+
+    const size = img.getSize();
+    if (size.width !== 16 || size.height !== 16) {
+        img = img.resize({ width: 16, height: 16 });
+    }
+    return img;
+}
+
+function trayImageFilename() {
+    if (trayIconStyle === 'ring') return 'trayColor.png';
+    if (trayIconStyle === 'dot') return 'trayDotColor.png';
+    return 'trayDotColor.png';
+}
+
+function buildTrayImage() {
+    if (trayIconStyle === 'text') {
+        return loadTrayNativeImage('trayDotTemplate.png', { template: true });
+    }
+    return loadTrayNativeImage(trayImageFilename());
+}
+
+/** macOS 26 Tahoe can allow an app in Menu Bar settings but still hide its NSStatusItem off-screen. */
+function repairMenuBarVisibility({ restartControlCenter = false } = {}) {
+    if (process.platform !== 'darwin' || !app.isPackaged) return;
+
+    const { execSync } = require('child_process');
+    const bundleId = require('./package.json').build?.appId || 'com.rjtuit.meeting-notifier.v2';
+
+    for (let i = 0; i < 8; i++) {
+        const key = `NSStatusItem VisibleCC Item-${i}`;
+        try {
+            const val = execSync(`defaults read ${bundleId} "${key}"`, { encoding: 'utf8' }).trim();
+            if (val === '0' || val === 'false') {
+                execSync(`defaults delete ${bundleId} "${key}"`);
+                console.log(`[menu-bar] cleared hidden default: ${key}`);
+            }
+        } catch {
+            // key absent — fine
+        }
+    }
+
+    try {
+        execSync(`defaults write ${bundleId} "NSStatusItem VisibleCC Item-0" -bool true`);
+    } catch (err) {
+        console.warn('[menu-bar] could not write visibility default:', err.message);
+    }
+
+    if (restartControlCenter) {
+        try {
+            execSync('killall ControlCenter');
+            console.log('[menu-bar] restarted Control Center');
+        } catch {
+            // Control Center not running
+        }
+    }
+}
+
+function createTray() {
+    const tooltip = tray?.getToolTip?.() || 'Meeting Notifier';
+    if (tray && !tray.isDestroyed()) {
+        tray.destroy();
+        tray = null;
+    }
+
+    const imgPath = resolveAssetPath(trayImageFilename());
+    if (fs.existsSync(imgPath)) {
+        // File path works more reliably than NativeImage on some macOS 26 builds.
+        tray = new Tray(imgPath);
+    } else {
+        const trayImg = buildTrayImage();
+        if (trayImg.isEmpty()) {
+            console.error('Tray icon missing or empty — menu bar icon may not appear');
+        }
+        tray = new Tray(trayImg);
+    }
+
+    tray.setToolTip(tooltip);
+    tray.on('click', () => { if (alert.active) stopAlert(); });
+    tray.on('right-click', () => { if (alert.active) stopAlert(); });
+    if (trayPaths) {
+        updateTrayTitle();
+        buildMenu(trayPaths);
+    }
+}
+
+function recreateTray() {
+    createTray();
+}
+
+function hudLabelText() {
+    if (alert.active) {
+        return `🔴 ${truncate(alert.meeting?.summary || 'Meeting', 18)}`;
+    }
+    const meeting = notifier?.nextMeeting;
+    if (!meeting) return 'No meetings';
+    const desc = describeNextMeeting(meeting);
+    if (!desc) return 'No meetings';
+    return `${truncate(desc.summary, 16)}  ${formatCountdown(desc.msUntil)}`;
+}
+
+function positionHudWindowDefault() {
+    if (!hudWindow || hudWindow.isDestroyed()) return;
+    const { workArea } = screen.getPrimaryDisplay();
+    const [w] = hudWindow.getSize();
+    hudWindow.setPosition(workArea.x + workArea.width - w - 14, workArea.y + 4);
+}
+
+function positionHudWindow() {
+    if (!hudWindow || hudWindow.isDestroyed()) return;
+    if (hudUserPosition) {
+        hudWindow.setPosition(hudUserPosition.x, hudUserPosition.y);
+    } else {
+        positionHudWindowDefault();
+    }
+}
+
+function createHudWindow() {
+    if (!showFloatingHud) return;
+    if (hudWindow && !hudWindow.isDestroyed()) return;
+
+    hudWindow = new BrowserWindow({
+        width: 220,
+        height: 30,
+        frame: false,
+        transparent: true,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        resizable: false,
+        focusable: false,
+        hasShadow: true,
+        show: false,
+        webPreferences: { contextIsolation: true, nodeIntegration: false },
+    });
+    hudWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    hudWindow.setAlwaysOnTop(true, 'floating', 1);
+    hudWindow.loadFile(path.join(__dirname, 'assets', 'hud.html'));
+    hudWindow.webContents.on('context-menu', (e, params) => {
+        e.preventDefault();
+        showAppMenu({ x: params.x, y: params.y });
+    });
+    hudWindow.on('moved', () => {
+        if (!hudWindow || hudWindow.isDestroyed()) return;
+        const [x, y] = hudWindow.getPosition();
+        hudUserPosition = { x, y };
+        saveSettings();
+    });
+    hudWindow.webContents.on('did-finish-load', () => updateHudWindow());
+    screen.on('display-metrics-changed', () => {
+        if (!hudUserPosition) positionHudWindowDefault();
+    });
+}
+
+function updateHudWindow() {
+    if (!showFloatingHud) {
+        if (hudWindow && !hudWindow.isDestroyed()) hudWindow.hide();
+        return;
+    }
+    createHudWindow();
+    if (!hudWindow || hudWindow.isDestroyed()) return;
+
+    const text = hudLabelText();
+    const alertClass = alert.active ? 'alert' : '';
+    hudWindow.webContents.executeJavaScript(
+        `document.getElementById('text').textContent = ${JSON.stringify(text)}; document.body.className = ${JSON.stringify(alertClass)};`
+    ).catch(() => {});
+
+    hudWindow.webContents.executeJavaScript(
+        `(() => { const w = document.body.scrollWidth + 20; return Math.min(320, Math.max(120, w)); })()`
+    ).then((width) => {
+        if (!hudWindow || hudWindow.isDestroyed()) return;
+        const [x, y] = hudWindow.getPosition();
+        hudWindow.setSize(Math.round(width), 30);
+        if (hudUserPosition) {
+            hudWindow.setPosition(x, y);
+        } else if (!hudWindow.isVisible()) {
+            positionHudWindowDefault();
+        }
+        if (!hudWindow.isVisible()) hudWindow.showInactive();
+    }).catch(() => {
+        if (!hudWindow.isDestroyed() && !hudWindow.isVisible()) {
+            positionHudWindow();
+            hudWindow.showInactive();
+        }
+    });
+}
+
+function fixMenuBarVisibility() {
+    repairMenuBarVisibility({ restartControlCenter: true });
+    setTimeout(() => createTray(), 1500);
+    dialog.showMessageBoxSync({
+        type: 'info',
+        title: 'Menu bar repair attempted',
+        message: 'macOS 26 can hide menu bar icons even when they are enabled in Settings.',
+        detail:
+            'Meeting Notifier restarted Control Center and re-registered its menu bar item.\n\n' +
+            'If you still do not see it:\n' +
+            '• Use the floating countdown pill (top-right)\n' +
+            '• Right-click the Dock icon for the full menu\n' +
+            '• Try quitting Ice temporarily — it can conflict on macOS 26\n' +
+            '• Toggle Meeting Notifier OFF then ON in System Settings → Menu Bar',
+        buttons: ['OK'],
+    });
 }
 
 // Compact countdown: "1h05m", "12m", or "45s".
@@ -329,12 +722,54 @@ function describeNextMeeting(meeting) {
     return { summary, time, msUntil, bar, label };
 }
 
+function menuBarMarker() {
+    if (alert.active) return alert.blinkOn ? '🔴' : '○';
+    return '●';
+}
+
 function renderAlertTitle() {
     if (!tray || !alert.active) return;
     const name = truncate(alert.meeting?.summary || 'Meeting', 18);
-    const dot = alert.blinkOn ? '🔴' : '⚪';
-    tray.setTitle(` ${dot} ${name} STARTED`);
+    let title = '';
+    if (menuBarTitle) {
+        const dot = alert.blinkOn ? '🔴' : '⚪';
+        title = ` ${dot} ${name} STARTED`;
+    } else if (trayIconStyle === 'text') {
+        title = ` ${menuBarMarker()}`;
+    }
+    setTrayTitleIfChanged(title);
     tray.setToolTip(`${alert.meeting?.summary || 'Meeting'} has started — click to dismiss`);
+    updateHudWindow();
+}
+
+function stopDismissPolling() {
+    if (alert.dismissPollTimer) clearInterval(alert.dismissPollTimer);
+    alert.dismissPollTimer = null;
+}
+
+async function startDismissPolling() {
+    if (!haPushConfigured() || alert.dismissPollTimer) return;
+    const entity = dismissEntityId();
+    if (!dismissEntityMissing) {
+        const test = await fetch(
+            `${process.env.HA_URL.replace(/\/+$/, '')}/api/states/${encodeURIComponent(entity)}`,
+            { headers: { Authorization: `Bearer ${process.env.HA_TOKEN}` } },
+        ).catch(() => null);
+        if (test && test.status === 404) {
+            dismissEntityMissing = true;
+            console.log(`📱 Phone dismiss unavailable — create ${entity} in Home Assistant (see ha/meeting-notifier-dismiss.yaml)`);
+            return;
+        }
+    } else {
+        return;
+    }
+    alert.dismissPollTimer = setInterval(async () => {
+        if (!alert.active) return;
+        if (!(await isHaDismissRequested())) return;
+        console.log('📱 Dismissed from phone — stopping Mac alert');
+        await acknowledgeHaDismiss();
+        stopAlert('phone');
+    }, 3000);
 }
 
 function startAlert(meeting) {
@@ -355,54 +790,185 @@ function startAlert(meeting) {
     if (alert.nagTimer) clearInterval(alert.nagTimer);
     alert.nagTimer = setInterval(() => {
         notifier?.blinkLight(2, 600);
+        const { title, message, urgent } = pushTextForKind('nag', meeting);
+        maybePushToPhone({ title, message, urgent, meeting });
     }, nagMs);
 
+    // Auto-dismiss when the meeting link is opened in a browser tab (covers
+    // non-Zoom links; Zoom is handled separately via CptHost detection).
+    if (alert.browserTimer) clearInterval(alert.browserTimer);
+    alert.browserTimer = setInterval(async () => {
+        const uri = alert.meeting?.videoEntryPoint?.uri;
+        if (!alert.active || !uri) return;
+        if (await isMeetingOpenInBrowser(uri)) {
+            console.log('✓ Meeting link open in a browser — dismissing alert');
+            stopAlert();
+        }
+    }, 4000);
+
+    startDismissPolling();
     if (trayPaths) buildMenu(trayPaths);
 }
 
-function stopAlert() {
-    if (!alert.active && !alert.timer && !alert.nagTimer) return;
+function stopAlert(source = 'local') {
+    if (!alert.active && !alert.timer && !alert.nagTimer && !alert.browserTimer && !alert.dismissPollTimer) return;
     if (alert.timer) clearInterval(alert.timer);
     if (alert.nagTimer) clearInterval(alert.nagTimer);
+    if (alert.browserTimer) clearInterval(alert.browserTimer);
+    stopDismissPolling();
     alert.timer = null;
     alert.nagTimer = null;
+    alert.browserTimer = null;
     alert.active = false;
     alert.meeting = null;
+    clearHaPhoneAlert().catch(() => {});
     updateTrayTitle();
     if (trayPaths) buildMenu(trayPaths);
+    if (source === 'phone') console.log('✓ Mac alert silenced');
+}
+
+function updateDockBadge() {
+    if (process.platform !== 'darwin' || !app.dock) return;
+
+    let badge = '';
+    if (alert.active) {
+        badge = '!';
+    } else {
+        const meeting = notifier?.nextMeeting;
+        if (meeting) {
+            const msUntil = moment(meeting.start.dateTime).diff(moment());
+            badge = msUntil <= 0 ? 'now' : formatCountdown(msUntil);
+        }
+    }
+
+    if (badge === lastDockBadge) return;
+    lastDockBadge = badge;
+    app.dock.setBadge(badge);
+}
+
+function setTrayTitleIfChanged(title) {
+    if (!tray || menuIsOpen) return;
+    if (title === lastTrayTitle) return;
+    lastTrayTitle = title;
+    tray.setTitle(title);
 }
 
 function updateTrayTitle() {
-    if (!tray) return;
+    if (tray) {
+        let title = '';
+        let tooltip = 'Meeting Notifier';
 
-    // While an overdue alert is active, the blink timer owns the title.
-    if (alert.active) {
-        renderAlertTitle();
-        return;
+        if (alert.active) {
+            const name = truncate(alert.meeting?.summary || 'Meeting', 18);
+            if (menuBarTitle) {
+                const dot = alert.blinkOn ? '🔴' : '⚪';
+                title = ` ${dot} ${name} STARTED`;
+            } else if (trayIconStyle === 'text') {
+                title = ` ${menuBarMarker()}`;
+            }
+            tooltip = `${alert.meeting?.summary || 'Meeting'} has started — click to dismiss`;
+        } else {
+            const meeting = notifier?.nextMeeting;
+            const inMeeting = notifier?.zoomIsRunning;
+
+            if (!meeting) {
+                if (menuBarTitle) title = ' No meetings';
+                else if (trayIconStyle === 'text') title = ` ${menuBarMarker()}`;
+                tooltip = inMeeting ? 'In a meeting — no upcoming meetings' : 'Meeting Notifier — no upcoming meetings';
+            } else {
+                const start = moment(meeting.start.dateTime);
+                const msUntil = start.diff(moment());
+                const summary = meeting.summary || '(no title)';
+                const countdown = msUntil <= 0 ? 'now' : formatCountdown(msUntil);
+                const bar = countdownBar(msUntil, 10);
+
+                if (menuBarTitle) {
+                    title = ` ${truncate(summary, 18)}  ${countdown}${bar ? ' ' + bar : ''}`;
+                } else if (trayIconStyle === 'text') {
+                    title = ` ${menuBarMarker()}`;
+                }
+                tooltip = `Next: ${summary} — ${countdown} (${start.format('h:mm a')})${inMeeting ? ' — in a meeting now' : ''}`;
+            }
+        }
+
+        setTrayTitleIfChanged(title);
+        tray.setToolTip(tooltip);
     }
+    updateDockBadge();
+    updateHudWindow();
+}
 
-    const meeting = notifier?.nextMeeting;
-    const inMeeting = notifier?.zoomIsRunning;
+function attachMenuLifecycle(menu) {
+    menu.on('menu-will-show', () => { menuIsOpen = true; });
+    menu.on('menu-will-close', () => {
+        menuIsOpen = false;
+        if (pendingMenuRebuild && trayPaths) {
+            pendingMenuRebuild = false;
+            lastMenuSignature = null;
+            buildMenu(trayPaths);
+        }
+        lastTrayTitle = null;
+        updateTrayTitle();
+    });
+}
 
-    // Always show the next meeting + countdown, even while in a meeting.
-    if (!meeting) {
-        tray.setTitle(' No meetings');
-        tray.setToolTip(inMeeting ? 'In a meeting — no upcoming meetings' : 'Meeting Notifier — no upcoming meetings');
-        return;
+function menuStructureSignature(paths) {
+    const next = notifier?.nextMeeting;
+    const current = notifier?.currentMeeting;
+    return JSON.stringify({
+        alert: alert.active,
+        status: notifier?.status,
+        err: notifier?.lastError?.message,
+        nextId: next?.id,
+        currentId: current?.id,
+        zoom: notifier?.zoomIsRunning,
+        authUrl: !!notifier?.authUrl,
+        nextLink: !!next?.videoEntryPoint?.uri,
+        currentLink: !!current?.videoEntryPoint?.uri,
+        lights: notifier?.keyLights?.length ?? 0,
+        pushEnabled,
+        menuBarTitle,
+        trayIconStyle,
+        showFloatingHud,
+        haPush: haPushConfigured(),
+        login: app.getLoginItemSettings().openAtLogin,
+        dataDir: paths?.dataDir,
+    });
+}
+
+function showAppMenu({ x, y } = {}) {
+    if (!cachedAppMenu && trayPaths) {
+        lastMenuSignature = null;
+        buildMenu(trayPaths);
     }
+    if (!cachedAppMenu) return;
 
-    const start = moment(meeting.start.dateTime);
-    const msUntil = start.diff(moment());
-    const summary = meeting.summary || '(no title)';
-    const countdown = msUntil <= 0 ? 'now' : formatCountdown(msUntil);
-    const bar = countdownBar(msUntil, 10);
+    const popupOpts = { window: hudWindow ?? logWindow ?? undefined };
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+        popupOpts.x = Math.round(x);
+        popupOpts.y = Math.round(y);
+    }
+    try {
+        cachedAppMenu.popup(popupOpts);
+    } catch (err) {
+        console.error('Failed to open app menu:', err.message);
+    }
+}
 
-    tray.setTitle(` ${truncate(summary, 18)}  ${countdown}${bar ? ' ' + bar : ''}`);
-    tray.setToolTip(`Next: ${summary} at ${start.format('h:mm a')}${inMeeting ? ' (in a meeting now)' : ''}`);
+function applyMenu(menu) {
+    cachedAppMenu = menu;
+    attachMenuLifecycle(menu);
+    if (tray && !tray.isDestroyed()) tray.setContextMenu(menu);
+    if (process.platform === 'darwin' && app.dock?.setMenu) {
+        app.dock.setMenu(menu);
+    }
 }
 
 function buildMenu(paths) {
     if (!tray) return;
+
+    const signature = menuStructureSignature(paths);
+    if (signature === lastMenuSignature) return;
     const items = [];
     const meeting = notifier?.nextMeeting;
     const desc = describeNextMeeting(meeting);
@@ -508,8 +1074,71 @@ function buildMenu(paths) {
         click: () => flashScreen(2, 600),
     });
     items.push({
-        label: 'Test overdue alert',
+        label: 'Fix Audio',
+        enabled: process.platform === 'darwin',
+        click: async () => {
+            console.log('🔊 Fix Audio — restarting Wave Link and resetting devices…');
+            const result = await fixAudio();
+            for (const step of result.steps) console.log(`  ✓ ${step}`);
+            if (result.ok) {
+                console.log('🔊 Fix Audio complete');
+            } else {
+                console.error('🔊 Fix Audio failed:', result.error);
+                dialog.showMessageBoxSync({
+                    type: 'warning',
+                    title: 'Fix Audio failed',
+                    message: result.error || 'Unknown error',
+                    detail: result.steps.length
+                        ? `Completed before failure:\n${result.steps.join('\n')}`
+                        : 'Install switchaudio-osx: brew install switchaudio-osx',
+                });
+            }
+        },
+    });
+    items.push({
+        label: 'Test overdue + phone push',
+        enabled: haPushConfigured(),
+        click: () => {
+            const meeting = notifier?.nextMeeting || { summary: 'Test meeting' };
+            startAlert(meeting);
+            const { title, message, urgent } = pushTextForKind('start', meeting);
+            sendHaPush({
+                title,
+                message,
+                urgent,
+                url: meeting?.videoEntryPoint?.uri,
+            });
+        },
+    });
+    items.push({
+        label: 'Test phone push (gentle)',
+        enabled: haPushConfigured(),
+        click: () => sendHaPush({
+            title: 'Meeting Notifier test',
+            message: 'Gentle reminder channel',
+            urgent: false,
+        }),
+    });
+    items.push({
+        label: 'Test overdue alert (Mac only)',
         click: () => startAlert(notifier?.nextMeeting || { summary: 'Test meeting' }),
+    });
+    items.push({
+        label: 'Menu bar icon hidden?',
+        click: () => {
+            dialog.showMessageBoxSync({
+                type: 'info',
+                title: 'Find Meeting Notifier in the menu bar',
+                message: 'macOS may hide menu bar icons when space is tight (especially on notched MacBooks).',
+                detail:
+                    '1. Look for a small circle icon on the right side of the menu bar.\n\n' +
+                    '2. Click the ◁ or >> control at the right edge of the menu bar to reveal hidden icons.\n\n' +
+                    '3. System Settings → Control Center → Menu Bar Only → drag items you don\'t need into Control Center.\n\n' +
+                    '4. Quit other menu bar apps to free space.\n\n' +
+                    'The meeting countdown also appears in this dropdown menu even if the title is hidden.',
+                buttons: ['OK'],
+            });
+        },
     });
     items.push({
         label: 'Show console window',
@@ -527,6 +1156,85 @@ function buildMenu(paths) {
     items.push({ type: 'separator' });
 
     items.push({
+        label: 'Show countdown in menu bar',
+        type: 'checkbox',
+        checked: menuBarTitle,
+        click: (item) => {
+            menuBarTitle = item.checked;
+            saveSettings();
+            updateTrayTitle();
+        },
+    });
+
+    items.push({
+        label: 'Menu bar marker',
+        submenu: [
+            {
+                label: '● text dot (smallest)',
+                type: 'radio',
+                checked: trayIconStyle === 'text',
+                click: () => {
+                    trayIconStyle = 'text';
+                    saveSettings();
+                    recreateTray();
+                },
+            },
+            {
+                label: 'Tiny color dot',
+                type: 'radio',
+                checked: trayIconStyle === 'dot',
+                click: () => {
+                    trayIconStyle = 'dot';
+                    saveSettings();
+                    recreateTray();
+                },
+            },
+            {
+                label: 'Color ring',
+                type: 'radio',
+                checked: trayIconStyle === 'ring',
+                click: () => {
+                    trayIconStyle = 'ring';
+                    saveSettings();
+                    recreateTray();
+                },
+            },
+        ],
+    });
+
+    items.push({
+        label: 'Reload menu bar icon',
+        click: () => recreateTray(),
+    });
+
+    items.push({
+        label: 'Fix menu bar visibility (macOS 26)',
+        click: () => fixMenuBarVisibility(),
+    });
+
+    items.push({
+        label: 'Show floating countdown',
+        type: 'checkbox',
+        checked: showFloatingHud,
+        click: (item) => {
+            showFloatingHud = item.checked;
+            saveSettings();
+            updateHudWindow();
+        },
+    });
+
+    items.push({
+        label: 'Push to phone when away',
+        type: 'checkbox',
+        checked: pushEnabled,
+        enabled: haPushConfigured(),
+        click: (item) => {
+            pushEnabled = item.checked;
+            saveSettings();
+        },
+    });
+
+    items.push({
         label: 'Launch at login',
         type: 'checkbox',
         checked: app.getLoginItemSettings().openAtLogin,
@@ -541,11 +1249,21 @@ function buildMenu(paths) {
     items.push({ type: 'separator' });
     items.push({ role: 'quit', label: 'Quit Meeting Notifier' });
 
-    tray.setContextMenu(Menu.buildFromTemplate(items));
+    if (menuIsOpen) {
+        pendingMenuRebuild = true;
+        return;
+    }
+
+    applyMenu(Menu.buildFromTemplate(items));
+    lastMenuSignature = signature;
 }
 
 function refreshUI(paths) {
     updateTrayTitle();
+    if (menuIsOpen) {
+        pendingMenuRebuild = true;
+        return;
+    }
     buildMenu(paths);
 }
 
@@ -558,6 +1276,8 @@ app.whenReady().then(() => {
 
     const paths = resolvePaths();
     trayPaths = paths;
+    loadSettings(paths.dataDir);
+    initPresenceTracking();
 
     // Load .env from the user-data location (or project folder in dev) BEFORE
     // requiring index.js, since dotenv only fills missing process.env entries.
@@ -570,11 +1290,12 @@ app.whenReady().then(() => {
 
     const { MeetingNotifier } = require('./index.js');
 
-    tray = new Tray(buildTrayImage());
+    createTray();
 
-    // Clicking the tray dismisses an active overdue alert.
-    tray.on('click', () => { if (alert.active) stopAlert(); });
-    tray.on('right-click', () => { if (alert.active) stopAlert(); });
+    if (process.platform === 'darwin' && app.dock && !dockShown) {
+        app.dock.show();
+        dockShown = true;
+    }
 
     notifier = new MeetingNotifier({
         credentialsPath: paths.credentialsPath,
@@ -582,20 +1303,36 @@ app.whenReady().then(() => {
         soundPath: paths.soundPath,
     });
     notifier.on('status', () => refreshUI(paths));
-    notifier.on('zoom-state', () => refreshUI(paths));
     notifier.on('meeting-update', () => refreshUI(paths));
+
+    // Detecting an active Zoom meeting (CptHost process) means you've joined,
+    // so auto-dismiss the overdue alert.
+    notifier.on('zoom-state', (running) => {
+        if (running && alert.active) {
+            console.log('✓ Detected you joined a meeting — dismissing alert');
+            stopAlert();
+        }
+        lastMenuSignature = null;
+        refreshUI(paths);
+    });
 
     // Screen flash stays in lockstep with the lights + sound: the notifier emits
     // blink-on/blink-off on every pulse of blinkLight().
     notifier.on('blink-on', showFlash);
     notifier.on('blink-off', hideFlash);
 
-    notifier.on('notification', ({ kind, meeting }) => {
-        // When a meeting starts, raise a blinking red overdue alert until dismissed.
-        if (kind === 'start') startAlert(meeting);
+    notifier.on('notification', async ({ kind, meeting }) => {
+        const { title, message, urgent } = pushTextForKind(kind, meeting);
+        await maybePushToPhone({ title, message, urgent, meeting });
+
+        // When a meeting starts, raise a blinking red overdue alert — unless you've
+        // already joined (Zoom or meeting link open in a browser).
+        if (kind === 'start' && !(await isAlreadyInMeeting(meeting))) startAlert(meeting);
     });
 
     refreshUI(paths);
+    createHudWindow();
+    updateHudWindow();
 
     if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
         const result = dialog.showMessageBoxSync({
@@ -632,10 +1369,18 @@ app.whenReady().then(() => {
     // window (it can be minimized or closed; the app keeps running in the tray).
     createLogWindow();
 
-    // Smooth countdown: update the menu bar title every second (cheap, doesn't
-    // disrupt an open menu). Rebuild the dropdown menu less often.
+    if (Notification.isSupported()) {
+        const n = new Notification({
+            title: 'Meeting Notifier is running',
+            body: 'Look for the colorful ring in the menu bar (check >> if hidden). Countdown shows on the Dock icon.',
+            silent: true,
+        });
+        n.on('click', () => createLogWindow());
+        n.show();
+    }
+
+    // Countdown tick — only updates badge/HUD/title when values change.
     setInterval(updateTrayTitle, 1000);
-    setInterval(() => buildMenu(paths), 15 * 1000);
 });
 
 // Clicking the Dock icon re-opens/focuses the console window.
@@ -654,12 +1399,19 @@ function cleanup() {
     cleanedUp = true;
     if (alert.timer) clearInterval(alert.timer);
     if (alert.nagTimer) clearInterval(alert.nagTimer);
+    if (alert.browserTimer) clearInterval(alert.browserTimer);
+    stopDismissPolling();
     notifier?.stop();
     destroyFlashWindows();
     if (tray && !tray.isDestroyed()) {
         tray.destroy();
         tray = null;
     }
+    if (hudWindow && !hudWindow.isDestroyed()) {
+        hudWindow.destroy();
+        hudWindow = null;
+    }
+    cachedAppMenu = null;
 }
 
 // Electron fires `before-quit` both for the menu "Quit" item and on SIGINT
