@@ -24,6 +24,7 @@ const DEFAULT_CALENDAR_CONFIG = {
     autoOpen: true,      // auto-open the meeting link when it starts
     warnNoLink: true,    // ding when a meeting has no detectable video link
     push: true,          // send HA phone push when away from the Mac
+    color: null,         // optional #hex or name — tray/HUD tint for this calendar
 };
 
 let openModulePromise;
@@ -34,7 +35,7 @@ function loadOpen() {
     return openModulePromise;
 }
 
-class MeetingNotifier extends EventEmitter {
+class OrbitNotifier extends EventEmitter {
     constructor({
         credentialsPath = path.join(__dirname, 'credentials.json'),
         dataDir = __dirname,
@@ -84,7 +85,7 @@ class MeetingNotifier extends EventEmitter {
     }
 
     start() {
-        console.log(chalk.green('🚀 Meeting Notifier started!'));
+        console.log(chalk.green('🚀 Orbit started!'));
 
         this.initializeElgatoLights();
 
@@ -186,7 +187,7 @@ class MeetingNotifier extends EventEmitter {
                 const { tokens } = await oauth2Client.getToken(code);
                 fs.writeFileSync(this.credentialsPath, JSON.stringify(tokens, null, 2));
                 oauth2Client.setCredentials(tokens);
-                res.send('<h2>✅ Authentication successful!</h2><p>You can close this window. Meeting Notifier is now running.</p>');
+                res.send('<h2>✅ Authentication successful!</h2><p>You can close this window. Orbit is now running.</p>');
                 console.log(chalk.green('✓ Authentication completed! Credentials saved.'));
                 this.stopAuthServer();
                 this._activateCalendar(oauth2Client);
@@ -213,7 +214,7 @@ class MeetingNotifier extends EventEmitter {
             });
         });
 
-        if (process.env.MN_NO_OPEN === '1') return;
+        if (process.env.ORBIT_NO_OPEN === '1' || process.env.MN_NO_OPEN === '1') return;
 
         try {
             const open = await loadOpen();
@@ -334,8 +335,9 @@ class MeetingNotifier extends EventEmitter {
         } catch {
             this._calCfgCache = this._calCfgCache || {};
         }
+        const fileDefaults = this._calCfgCache._defaults || {};
         const overrides = (calendarId && this._calCfgCache[calendarId]) || {};
-        return { ...DEFAULT_CALENDAR_CONFIG, ...overrides };
+        return { ...DEFAULT_CALENDAR_CONFIG, ...fileDefaults, ...overrides };
     }
 
     async getNextMeeting() {
@@ -734,15 +736,15 @@ class MeetingNotifier extends EventEmitter {
     }
 }
 
-module.exports = { MeetingNotifier };
+module.exports = { OrbitNotifier };
 
 // Run as a CLI when invoked directly (e.g. `npm start`).
 if (require.main === module) {
-    const notifier = new MeetingNotifier();
+    const notifier = new OrbitNotifier();
     notifier.start();
 
     process.on('SIGINT', () => {
-        console.log(chalk.yellow('\n👋 Shutting down Meeting Notifier...'));
+        console.log(chalk.yellow('\n👋 Shutting down Orbit...'));
         notifier.stop();
         process.exit(0);
     });

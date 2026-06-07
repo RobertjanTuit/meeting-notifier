@@ -15,6 +15,7 @@
       color: #fff;
       display: flex;
       align-items: center;
+      gap: 6px;
       padding: 0 10px;
       background: rgba(28, 28, 30, 0.92);
       border-radius: 8px;
@@ -25,11 +26,19 @@
       cursor: default;
     }
     body.alert { background: rgba(120, 20, 20, 0.94); border-color: rgba(255, 100, 100, 0.4); }
-    .dot { color: #ff7846; margin-right: 5px; }
-    body.alert .dot { color: #ff4444; }
+    .orbit { width: 14px; height: 14px; flex-shrink: 0; }
+    .orbit .track { stroke: rgba(255, 255, 255, 0.22); }
+    .orbit .arc { transition: stroke-dasharray 0.2s linear; }
+    .orbit .dot { stroke: none; }
   </style>
 </head>
 <body>
-  <span class="dot">●</span><span id="text">Meeting Notifier</span>
+  <svg class="orbit" viewBox="0 0 16 16" aria-hidden="true">
+    <circle class="track" cx="8" cy="8" r="6.2" fill="none" stroke-width="1.6"/>
+    <circle class="arc" cx="8" cy="8" r="6.2" fill="none" stroke-width="1.6"
+      stroke-linecap="round" transform="rotate(-90 8 8)"/>
+    <circle class="dot" cx="8" cy="8" r="2.2"/>
+  </svg>
+  <span id="text">Orbit</span>
 </body>
 </html>

@@ -4,9 +4,10 @@
  * use a dedicated high-importance channel.
  */
 
-const HA_CHANNEL = 'Meeting Reminders';
-const HA_ALERT_TAG = 'meeting-notifier-alert';
-const HA_DISMISS_ACTION = 'MN_DISMISS';
+const HA_CHANNEL = 'Orbit Reminders';
+const HA_ALERT_TAG = 'orbit-alert';
+const HA_ALERT_TAGS = [HA_ALERT_TAG, 'meeting-notifier-alert'];
+const HA_DISMISS_ACTION = 'ORBIT_DISMISS';
 
 function haBase() {
     return process.env.HA_URL.replace(/\/+$/, '');
@@ -25,7 +26,7 @@ function notifyEndpoint() {
 }
 
 function dismissEntityId() {
-    return process.env.HA_DISMISS_ENTITY || 'input_boolean.meeting_notifier_dismiss';
+    return process.env.HA_DISMISS_ENTITY || 'input_boolean.orbit_dismiss';
 }
 
 function buildDismissActions(url) {
@@ -136,15 +137,17 @@ async function sendHaPush({ title, message, urgent = false, url, dismissible }) 
 async function clearHaPhoneAlert() {
     if (!isConfigured()) return false;
     try {
-        const res = await fetch(notifyEndpoint(), {
-            method: 'POST',
-            headers: haHeaders(),
-            body: JSON.stringify({
-                message: 'clear_notification',
-                data: { tag: HA_ALERT_TAG },
-            }),
-        });
-        return res.ok;
+        for (const tag of HA_ALERT_TAGS) {
+            await fetch(notifyEndpoint(), {
+                method: 'POST',
+                headers: haHeaders(),
+                body: JSON.stringify({
+                    message: 'clear_notification',
+                    data: { tag },
+                }),
+            });
+        }
+        return true;
     } catch (err) {
         console.error('📱 HA clear notification error:', err.message);
         return false;
