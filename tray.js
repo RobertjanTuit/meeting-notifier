@@ -29,7 +29,22 @@ let lastMenuSignature = null;
 let dockShown = false;
 let hudUserPosition = null;
 let cachedAppMenu = null;
+let lastTrayIconKey = null;
+let sawLaunchNotification = false;
 const logBuffer = [];
+
+const CALENDAR_COLOR_NAMES = {
+    orange: '#ff7846',
+    blue: '#4da3ff',
+    green: '#7ed957',
+    purple: '#c77dff',
+    yellow: '#ffd60a',
+    pink: '#ff6b9d',
+    red: '#ff4444',
+    teal: '#2dd4bf',
+};
+
+const CALENDAR_COLOR_PALETTE = Object.values(CALENDAR_COLOR_NAMES);
 
 // Screen flash appearance: a soft, warm yellow that's easy on the eyes.
 const FLASH_COLOR = '#FFD980';
@@ -60,6 +75,7 @@ function loadSettings(dataDir) {
         if (Number.isFinite(raw.hudX) && Number.isFinite(raw.hudY)) {
             hudUserPosition = { x: raw.hudX, y: raw.hudY };
         }
+        if (raw.sawLaunchNotification === true) sawLaunchNotification = true;
     } catch {
         // first run — defaults apply
     }
@@ -68,7 +84,9 @@ function loadSettings(dataDir) {
 function saveSettings() {
     if (!settingsPath) return;
     try {
-        const data = { pushEnabled, menuBarTitle, trayIconStyle, showFloatingHud };
+        const data = {
+            pushEnabled, menuBarTitle, trayIconStyle, showFloatingHud, sawLaunchNotification,
+        };
         if (hudUserPosition) {
             data.hudX = hudUserPosition.x;
             data.hudY = hudUserPosition.y;
@@ -234,7 +252,7 @@ function createLogWindow() {
     logWindow = new BrowserWindow({
         width: 780,
         height: 460,
-        title: 'Meeting Notifier — Console',
+        title: 'Orbit — Console',
         backgroundColor: '#1e1e1e',
         webPreferences: { nodeIntegration: true, contextIsolation: false },
     });
@@ -418,15 +436,44 @@ async function flashScreen(times = 1, duration = 600) {
     }
 }
 
+const CONFIG_FILE_NAMES = ['.env', 'credentials.json', 'calendars.json', 'settings.json', 'events-log.json'];
+
+/** User config lives here — separate from Electron's default userData (`…/orbit/`). */
+function orbitConfigDir() {
+    return path.join(app.getPath('appData'), 'com.rjtuit.orbit');
+}
+
+function copyMissingConfigFiles(fromDir, toDir) {
+    if (!fs.existsSync(fromDir)) return false;
+    if (!fs.existsSync(toDir)) fs.mkdirSync(toDir, { recursive: true });
+    let copied = false;
+    for (const name of CONFIG_FILE_NAMES) {
+        const src = path.join(fromDir, name);
+        const dst = path.join(toDir, name);
+        if (fs.existsSync(src) && !fs.existsSync(dst)) {
+            fs.copyFileSync(src, dst);
+            console.log(`📂 Migrated ${name}: ${fromDir} → ${toDir}`);
+            copied = true;
+        }
+    }
+    return copied;
+}
+
+function resolveConfigDir() {
+    const configDir = orbitConfigDir();
+    const legacyDir = path.join(app.getPath('appData'), 'meeting-notifier');
+    copyMissingConfigFiles(legacyDir, configDir);
+    if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+    return configDir;
+}
+
 function resolvePaths() {
     let configDir;
     let soundPath;
 
     if (app.isPackaged) {
-        // Packaged: use a deterministic config dir so it doesn't depend on
-        // app.getName() (which differs between builds). Always:
-        //   ~/Library/Application Support/meeting-notifier/
-        configDir = path.join(app.getPath('appData'), 'meeting-notifier');
+        //   ~/Library/Application Support/com.rjtuit.orbit/
+        configDir = resolveConfigDir();
         // sounds/ is asarUnpacked so afplay can read a real file path.
         const unpacked = path.join(process.resourcesPath, 'app.asar.unpacked', 'sounds', 'ding.wav');
         soundPath = fs.existsSync(unpacked) ? unpacked : path.join(__dirname, 'sounds', 'ding.wav');
@@ -450,41 +497,149 @@ function resolvePaths() {
     };
 }
 
-function resolveAssetPath(filename) {
-    if (app.isPackaged) {
-        const unpacked = path.join(process.resourcesPath, 'app.asar.unpacked', 'assets', filename);
-        if (fs.existsSync(unpacked)) return unpacked;
-    }
-    return path.join(__dirname, 'assets', filename);
+function normalizeCalendarColor(color) {
+    if (!color || typeof color !== 'string') return null;
+    const c = color.trim();
+    if (/^#[0-9a-fA-F]{6}$/.test(c)) return c.toLowerCase();
+    return CALENDAR_COLOR_NAMES[c.toLowerCase()] || null;
 }
 
-function loadTrayNativeImage(filename, { template = false } = {}) {
-    const assetPath = resolveAssetPath(filename);
-    if (!fs.existsSync(assetPath)) return nativeImage.createEmpty();
-
-    // Buffer load is more reliable than createFromPath for asar/unpacked assets.
-    let img = nativeImage.createFromBuffer(fs.readFileSync(assetPath));
-    if (img.isEmpty()) return img;
-    if (template) img.setTemplateImage(true);
-
-    const size = img.getSize();
-    if (size.width !== 16 || size.height !== 16) {
-        img = img.resize({ width: 16, height: 16 });
-    }
-    return img;
+function calendarColorForMeeting(meeting) {
+    if (!meeting) return CALENDAR_COLOR_PALETTE[0];
+    const cfg = notifier?.getCalendarConfig?.(meeting._calendarId);
+    const configured = normalizeCalendarColor(cfg?.color);
+    if (configured) return configured;
+    const id = meeting._calendarId || '';
+    let hash = 0;
+    for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+    return CALENDAR_COLOR_PALETTE[hash % CALENDAR_COLOR_PALETTE.length];
 }
 
-function trayImageFilename() {
-    if (trayIconStyle === 'ring') return 'trayColor.png';
-    if (trayIconStyle === 'dot') return 'trayDotColor.png';
-    return 'trayDotColor.png';
+function calendarShortName(calendarId) {
+    if (!calendarId) return 'Calendar';
+    if (calendarId.includes('@')) return calendarId.split('@')[0];
+    return truncate(calendarId, 22);
 }
 
-function buildTrayImage() {
-    if (trayIconStyle === 'text') {
-        return loadTrayNativeImage('trayDotTemplate.png', { template: true });
+function hexToRgb(hex) {
+    const h = hex.replace('#', '');
+    return [
+        parseInt(h.slice(0, 2), 16),
+        parseInt(h.slice(2, 4), 16),
+        parseInt(h.slice(4, 6), 16),
+    ];
+}
+
+const ORBIT_COUNTDOWN_MS = 60 * 60 * 1000;
+const ORBIT_OVERDUE_MS = 15 * 60 * 1000;
+
+function createColoredDotImage(hex, size = 16) {
+    return createOrbitIconImage(hex, null, size);
+}
+
+function createOrbitIconImage(hex, arcFraction, logicalSize = 18, { alert = false } = {}) {
+    const scale = 2;
+    const size = logicalSize * scale;
+    const [r, g, b] = hexToRgb(hex);
+    const buf = Buffer.alloc(size * size * 4);
+    const cx = size / 2;
+    const cy = size / 2;
+    const rOuter = size * 0.42;
+    const stroke = Math.max(2.4, size * 0.14);
+    const dotR = size * 0.2;
+    const circumference = 2 * Math.PI * rOuter;
+    const arcLen = arcFraction == null ? 0 : Math.max(0, Math.min(1, arcFraction)) * circumference;
+    const showTrack = arcFraction != null && arcFraction < 1;
+
+    const paint = (x, y, pr, pg, pb, a = 255) => {
+        if (x < 0 || y < 0 || x >= size || y >= size) return;
+        const i = (y * size + x) * 4;
+        buf[i] = pr;
+        buf[i + 1] = pg;
+        buf[i + 2] = pb;
+        buf[i + 3] = a;
+    };
+
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+            const dx = x - cx + 0.5;
+            const dy = y - cy + 0.5;
+            const dist = Math.hypot(dx, dy);
+
+            if (dist <= dotR) {
+                paint(x, y, r, g, b);
+                continue;
+            }
+
+            if (dist < rOuter - stroke || dist > rOuter) continue;
+
+            const angle = Math.atan2(dy, dx);
+            const fromTop = (angle + Math.PI / 2 + 2 * Math.PI) % (2 * Math.PI);
+            const pos = (fromTop / (2 * Math.PI)) * circumference;
+
+            if (showTrack) {
+                paint(x, y, 120, 120, 128, alert ? 90 : 70);
+            }
+            if (arcFraction != null && pos <= arcLen) {
+                paint(x, y, r, g, b);
+            }
+        }
     }
-    return loadTrayNativeImage(trayImageFilename());
+
+    return nativeImage.createFromBitmap(buf, { width: size, height: size, scaleFactor: scale });
+}
+
+/** Orbit ring: depletes in the last hour before a meeting; fills red while overdue. */
+function orbitVisualState() {
+    if (alert.active) {
+        const start = alert.meeting?.start?.dateTime ? moment(alert.meeting.start.dateTime) : null;
+        const msOver = start ? moment().diff(start) : 0;
+        const arc = Math.min(1, Math.max(0, msOver / ORBIT_OVERDUE_MS));
+        return {
+            color: alert.blinkOn ? '#ff3333' : '#cc4444',
+            arc,
+            alert: true,
+        };
+    }
+
+    const meeting = notifier?.nextMeeting;
+    const color = calendarColorForMeeting(meeting);
+    if (!meeting?.start?.dateTime) return { color, arc: null, alert: false };
+
+    const msUntil = moment(meeting.start.dateTime).diff(moment());
+    if (trayIconStyle === 'dot') return { color, arc: null, alert: false };
+    if (msUntil > ORBIT_COUNTDOWN_MS) {
+        if (trayIconStyle === 'ring') return { color, arc: 1, alert: false };
+        return { color, arc: null, alert: false };
+    }
+    if (msUntil > 0) {
+        return { color, arc: msUntil / ORBIT_COUNTDOWN_MS, alert: false };
+    }
+    return { color, arc: 0, alert: false };
+}
+
+function orbitIconCacheKey(state) {
+    const prefix = trayIconStyle;
+    if (state.alert) {
+        return `${prefix}-alert-${state.color}-${Math.floor((state.arc ?? 0) * 60)}`;
+    }
+    if (state.arc == null) return `${prefix}-dot-${state.color}`;
+    if (state.arc > 1 / 60) return `${prefix}-arc-${state.color}-${Math.floor(state.arc * 60)}`;
+    return `${prefix}-arc-${state.color}-${Math.floor(state.arc * 360)}`;
+}
+
+function trayImageForState() {
+    const state = orbitVisualState();
+    return createOrbitIconImage(state.color, state.arc, 18, { alert: state.alert });
+}
+
+function updateTrayIcon() {
+    if (!tray || tray.isDestroyed()) return;
+    const state = orbitVisualState();
+    const iconKey = orbitIconCacheKey(state);
+    if (iconKey === lastTrayIconKey) return;
+    lastTrayIconKey = iconKey;
+    tray.setImage(trayImageForState());
 }
 
 /** macOS 26 Tahoe can allow an app in Menu Bar settings but still hide its NSStatusItem off-screen. */
@@ -492,7 +647,7 @@ function repairMenuBarVisibility({ restartControlCenter = false } = {}) {
     if (process.platform !== 'darwin' || !app.isPackaged) return;
 
     const { execSync } = require('child_process');
-    const bundleId = require('./package.json').build?.appId || 'com.rjtuit.meeting-notifier.v2';
+    const bundleId = require('./package.json').build?.appId || 'com.rjtuit.orbit';
 
     for (let i = 0; i < 8; i++) {
         const key = `NSStatusItem VisibleCC Item-${i}`;
@@ -524,23 +679,14 @@ function repairMenuBarVisibility({ restartControlCenter = false } = {}) {
 }
 
 function createTray() {
-    const tooltip = tray?.getToolTip?.() || 'Meeting Notifier';
+    const tooltip = tray?.getToolTip?.() || 'Orbit';
     if (tray && !tray.isDestroyed()) {
         tray.destroy();
         tray = null;
     }
 
-    const imgPath = resolveAssetPath(trayImageFilename());
-    if (fs.existsSync(imgPath)) {
-        // File path works more reliably than NativeImage on some macOS 26 builds.
-        tray = new Tray(imgPath);
-    } else {
-        const trayImg = buildTrayImage();
-        if (trayImg.isEmpty()) {
-            console.error('Tray icon missing or empty — menu bar icon may not appear');
-        }
-        tray = new Tray(trayImg);
-    }
+    lastTrayIconKey = null;
+    tray = new Tray(trayImageForState());
 
     tray.setToolTip(tooltip);
     tray.on('click', () => { if (alert.active) stopAlert(); });
@@ -551,8 +697,23 @@ function createTray() {
     }
 }
 
+function applyTrayIconStyle() {
+    lastTrayIconKey = null;
+    updateTrayIcon();
+}
+
+/** Destroying the tray during its own menu callback makes macOS 26 drop the status item. */
+function recreateTrayDeferred() {
+    setTimeout(() => {
+        createTray();
+        if (app.isPackaged && process.platform === 'darwin') {
+            repairMenuBarVisibility({ restartControlCenter: false });
+        }
+    }, 300);
+}
+
 function recreateTray() {
-    createTray();
+    recreateTrayDeferred();
 }
 
 function hudLabelText() {
@@ -628,8 +789,16 @@ function updateHudWindow() {
 
     const text = hudLabelText();
     const alertClass = alert.active ? 'alert' : '';
+    const orbit = orbitVisualState();
+    const circumference = (2 * Math.PI * 6.2).toFixed(2);
+    const dash = orbit.arc == null ? '0' : (orbit.arc * circumference).toFixed(2);
     hudWindow.webContents.executeJavaScript(
-        `document.getElementById('text').textContent = ${JSON.stringify(text)}; document.body.className = ${JSON.stringify(alertClass)};`
+        `document.getElementById('text').textContent = ${JSON.stringify(text)};`
+        + `document.body.className = ${JSON.stringify(alertClass)};`
+        + `document.querySelector('.dot').setAttribute('fill', ${JSON.stringify(orbit.color)});`
+        + `document.querySelector('.arc').setAttribute('stroke', ${JSON.stringify(orbit.color)});`
+        + `document.querySelector('.arc').setAttribute('stroke-dasharray', ${JSON.stringify(`${dash} ${circumference}`)});`
+        + `document.querySelector('.track').style.display = ${JSON.stringify(orbit.arc == null ? 'none' : '')};`
     ).catch(() => {});
 
     hudWindow.webContents.executeJavaScript(
@@ -654,18 +823,18 @@ function updateHudWindow() {
 
 function fixMenuBarVisibility() {
     repairMenuBarVisibility({ restartControlCenter: true });
-    setTimeout(() => createTray(), 1500);
+    setTimeout(() => recreateTrayDeferred(), 1500);
     dialog.showMessageBoxSync({
         type: 'info',
         title: 'Menu bar repair attempted',
         message: 'macOS 26 can hide menu bar icons even when they are enabled in Settings.',
         detail:
-            'Meeting Notifier restarted Control Center and re-registered its menu bar item.\n\n' +
+            'Orbit restarted Control Center and re-registered its menu bar item.\n\n' +
             'If you still do not see it:\n' +
             '• Use the floating countdown pill (top-right)\n' +
             '• Right-click the Dock icon for the full menu\n' +
             '• Try quitting Ice temporarily — it can conflict on macOS 26\n' +
-            '• Toggle Meeting Notifier OFF then ON in System Settings → Menu Bar',
+            '• Toggle Orbit OFF then ON in System Settings → Menu Bar',
         buttons: ['OK'],
     });
 }
@@ -722,11 +891,6 @@ function describeNextMeeting(meeting) {
     return { summary, time, msUntil, bar, label };
 }
 
-function menuBarMarker() {
-    if (alert.active) return alert.blinkOn ? '🔴' : '○';
-    return '●';
-}
-
 function renderAlertTitle() {
     if (!tray || !alert.active) return;
     const name = truncate(alert.meeting?.summary || 'Meeting', 18);
@@ -734,11 +898,10 @@ function renderAlertTitle() {
     if (menuBarTitle) {
         const dot = alert.blinkOn ? '🔴' : '⚪';
         title = ` ${dot} ${name} STARTED`;
-    } else if (trayIconStyle === 'text') {
-        title = ` ${menuBarMarker()}`;
     }
     setTrayTitleIfChanged(title);
     tray.setToolTip(`${alert.meeting?.summary || 'Meeting'} has started — click to dismiss`);
+    updateTrayIcon();
     updateHudWindow();
 }
 
@@ -757,7 +920,7 @@ async function startDismissPolling() {
         ).catch(() => null);
         if (test && test.status === 404) {
             dismissEntityMissing = true;
-            console.log(`📱 Phone dismiss unavailable — create ${entity} in Home Assistant (see ha/meeting-notifier-dismiss.yaml)`);
+            console.log(`📱 Phone dismiss unavailable — create ${entity} in Home Assistant (see ha/orbit-dismiss.yaml)`);
             return;
         }
     } else {
@@ -786,7 +949,7 @@ function startAlert(meeting) {
 
     // Keep bugging every minute until dismissed. blinkLight() drives sound +
     // lights + screen together via blink-on/blink-off events.
-    const nagMs = Number(process.env.MN_NAG_MS) || 60 * 1000;
+    const nagMs = Number(process.env.ORBIT_NAG_MS || process.env.MN_NAG_MS) || 60 * 1000;
     if (alert.nagTimer) clearInterval(alert.nagTimer);
     alert.nagTimer = setInterval(() => {
         notifier?.blinkLight(2, 600);
@@ -856,15 +1019,13 @@ function setTrayTitleIfChanged(title) {
 function updateTrayTitle() {
     if (tray) {
         let title = '';
-        let tooltip = 'Meeting Notifier';
+        let tooltip = 'Orbit';
 
         if (alert.active) {
             const name = truncate(alert.meeting?.summary || 'Meeting', 18);
             if (menuBarTitle) {
                 const dot = alert.blinkOn ? '🔴' : '⚪';
                 title = ` ${dot} ${name} STARTED`;
-            } else if (trayIconStyle === 'text') {
-                title = ` ${menuBarMarker()}`;
             }
             tooltip = `${alert.meeting?.summary || 'Meeting'} has started — click to dismiss`;
         } else {
@@ -873,26 +1034,25 @@ function updateTrayTitle() {
 
             if (!meeting) {
                 if (menuBarTitle) title = ' No meetings';
-                else if (trayIconStyle === 'text') title = ` ${menuBarMarker()}`;
-                tooltip = inMeeting ? 'In a meeting — no upcoming meetings' : 'Meeting Notifier — no upcoming meetings';
+                tooltip = inMeeting ? 'In a meeting — no upcoming meetings' : 'Orbit — no upcoming meetings';
             } else {
                 const start = moment(meeting.start.dateTime);
                 const msUntil = start.diff(moment());
                 const summary = meeting.summary || '(no title)';
                 const countdown = msUntil <= 0 ? 'now' : formatCountdown(msUntil);
                 const bar = countdownBar(msUntil, 10);
+                const cal = calendarShortName(meeting._calendarId);
 
                 if (menuBarTitle) {
                     title = ` ${truncate(summary, 18)}  ${countdown}${bar ? ' ' + bar : ''}`;
-                } else if (trayIconStyle === 'text') {
-                    title = ` ${menuBarMarker()}`;
                 }
-                tooltip = `Next: ${summary} — ${countdown} (${start.format('h:mm a')})${inMeeting ? ' — in a meeting now' : ''}`;
+                tooltip = `Next: ${summary} (${cal}) — ${countdown} (${start.format('h:mm a')})${inMeeting ? ' — in a meeting now' : ''}`;
             }
         }
 
         setTrayTitleIfChanged(title);
         tray.setToolTip(tooltip);
+        updateTrayIcon();
     }
     updateDockBadge();
     updateHudWindow();
@@ -920,6 +1080,8 @@ function menuStructureSignature(paths) {
         status: notifier?.status,
         err: notifier?.lastError?.message,
         nextId: next?.id,
+        nextCal: next?._calendarId,
+        nextColor: calendarColorForMeeting(next),
         currentId: current?.id,
         zoom: notifier?.zoomIsRunning,
         authUrl: !!notifier?.authUrl,
@@ -1010,6 +1172,12 @@ function buildMenu(paths) {
             enabled: false,
         });
     } else if (desc) {
+        const calMeeting = notifier?.nextMeeting;
+        items.push({
+            label: calendarShortName(calMeeting?._calendarId),
+            icon: createColoredDotImage(calendarColorForMeeting(calMeeting), 12),
+            enabled: false,
+        });
         items.push({ label: desc.label, enabled: false });
         if (desc.bar) {
             items.push({ label: `${desc.bar}  ${formatCountdown(desc.msUntil)} left`, enabled: false });
@@ -1114,7 +1282,7 @@ function buildMenu(paths) {
         label: 'Test phone push (gentle)',
         enabled: haPushConfigured(),
         click: () => sendHaPush({
-            title: 'Meeting Notifier test',
+            title: 'Orbit test',
             message: 'Gentle reminder channel',
             urgent: false,
         }),
@@ -1128,7 +1296,7 @@ function buildMenu(paths) {
         click: () => {
             dialog.showMessageBoxSync({
                 type: 'info',
-                title: 'Find Meeting Notifier in the menu bar',
+                title: 'Find Orbit in the menu bar',
                 message: 'macOS may hide menu bar icons when space is tight (especially on notched MacBooks).',
                 detail:
                     '1. Look for a small circle icon on the right side of the menu bar.\n\n' +
@@ -1167,36 +1335,36 @@ function buildMenu(paths) {
     });
 
     items.push({
-        label: 'Menu bar marker',
+        label: 'Menu bar icon',
         submenu: [
             {
-                label: '● text dot (smallest)',
+                label: 'Orbit countdown (last hour)',
                 type: 'radio',
                 checked: trayIconStyle === 'text',
                 click: () => {
                     trayIconStyle = 'text';
                     saveSettings();
-                    recreateTray();
+                    applyTrayIconStyle();
                 },
             },
             {
-                label: 'Tiny color dot',
+                label: 'Dot only (calendar color)',
                 type: 'radio',
                 checked: trayIconStyle === 'dot',
                 click: () => {
                     trayIconStyle = 'dot';
                     saveSettings();
-                    recreateTray();
+                    applyTrayIconStyle();
                 },
             },
             {
-                label: 'Color ring',
+                label: 'Full ring + countdown',
                 type: 'radio',
                 checked: trayIconStyle === 'ring',
                 click: () => {
                     trayIconStyle = 'ring';
                     saveSettings();
-                    recreateTray();
+                    applyTrayIconStyle();
                 },
             },
         ],
@@ -1247,7 +1415,7 @@ function buildMenu(paths) {
     });
 
     items.push({ type: 'separator' });
-    items.push({ role: 'quit', label: 'Quit Meeting Notifier' });
+    items.push({ role: 'quit', label: 'Quit Orbit' });
 
     if (menuIsOpen) {
         pendingMenuRebuild = true;
@@ -1288,7 +1456,7 @@ app.whenReady().then(() => {
         }
     }
 
-    const { MeetingNotifier } = require('./index.js');
+    const { OrbitNotifier } = require('./index.js');
 
     createTray();
 
@@ -1297,7 +1465,7 @@ app.whenReady().then(() => {
         dockShown = true;
     }
 
-    notifier = new MeetingNotifier({
+    notifier = new OrbitNotifier({
         credentialsPath: paths.credentialsPath,
         dataDir: paths.dataDir,
         soundPath: paths.soundPath,
@@ -1337,10 +1505,10 @@ app.whenReady().then(() => {
     if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
         const result = dialog.showMessageBoxSync({
             type: 'warning',
-            title: 'Meeting Notifier — Setup needed',
+            title: 'Orbit — Setup needed',
             message: 'Missing configuration',
             detail:
-                `Meeting Notifier needs a .env file at:\n\n${paths.envCandidates[0]}\n\n` +
+                `Orbit needs a .env file at:\n\n${paths.envCandidates[0]}\n\n` +
                 'It must define GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, and ELGATO_KEY_LIGHTS.\n\n' +
                 'Would you like to open the config folder now?',
             buttons: ['Open config folder', 'Continue without config'],
@@ -1355,28 +1523,26 @@ app.whenReady().then(() => {
     try {
         notifier.start();
     } catch (error) {
-        dialog.showErrorBox('Failed to start Meeting Notifier', error.message);
+        dialog.showErrorBox('Failed to start Orbit', error.message);
     }
 
-    if (process.env.MN_TEST_FLASH === '1') {
+    if (process.env.ORBIT_TEST_FLASH === '1' || process.env.MN_TEST_FLASH === '1') {
         setTimeout(() => {
             console.log('[test] flashing screen 3x');
             flashScreen(3, 600).then(() => console.log('[test] flash done'));
         }, 800);
     }
 
-    // Show the console window on launch so a Dock-launched app has a visible
-    // window (it can be minimized or closed; the app keeps running in the tray).
-    createLogWindow();
-
-    if (Notification.isSupported()) {
+    if (Notification.isSupported() && !sawLaunchNotification) {
         const n = new Notification({
-            title: 'Meeting Notifier is running',
-            body: 'Look for the colorful ring in the menu bar (check >> if hidden). Countdown shows on the Dock icon.',
+            title: 'Orbit is running',
+            body: 'Menu bar orbit color matches your calendar. Right-click the Dock icon or floating pill for the menu.',
             silent: true,
         });
         n.on('click', () => createLogWindow());
         n.show();
+        sawLaunchNotification = true;
+        saveSettings();
     }
 
     // Countdown tick — only updates badge/HUD/title when values change.

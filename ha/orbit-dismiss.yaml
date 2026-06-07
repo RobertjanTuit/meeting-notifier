@@ -5,22 +5,26 @@
 #
 # STEP 1 — Create helper (UI):
 #   Settings → Devices & services → Helpers → Create helper → Toggle
-#   Name: Meeting Notifier Dismiss
-#   Entity ID: input_boolean.meeting_notifier_dismiss
+#   Name: Orbit Dismiss
+#   Entity ID: input_boolean.orbit_dismiss
 #
 # STEP 2 — Create automation:
-#   Paste the contents of meeting-notifier-dismiss-automation.yaml
+#   Paste the contents of orbit-dismiss-automation.yaml
 #   into Automations → Create → Edit in YAML
 
 input_boolean:
-  meeting_notifier_dismiss:
-    name: Meeting Notifier Dismiss
+  orbit_dismiss:
+    name: Orbit Dismiss
 
 automation:
-  - id: meeting_notifier_dismiss_from_phone
-    alias: Meeting Notifier — dismiss alert from phone
+  - id: orbit_dismiss_from_phone
+    alias: Orbit — dismiss alert from phone
     mode: single
     trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: ORBIT_DISMISS
       - platform: event
         event_type: mobile_app_notification_action
         event_data:
@@ -28,4 +32,4 @@ automation:
     action:
       - service: input_boolean.turn_on
         target:
-          entity_id: input_boolean.meeting_notifier_dismiss
+          entity_id: input_boolean.orbit_dismiss

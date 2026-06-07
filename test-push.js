@@ -17,9 +17,9 @@ async function main() {
     }
 
     if (!urgentOnly) {
-        console.log('Sending gentle push (Meeting Reminders channel)...');
+        console.log('Sending gentle push (Orbit Reminders channel)...');
         await sendHaPush({
-            title: 'Meeting Notifier test',
+            title: 'Orbit test',
             message: 'Gentle reminder — override DnD on this channel in Android settings',
             urgent: false,
         });
