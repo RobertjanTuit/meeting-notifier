@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const log = require('./orbit-log.js');
 
 /** Google Calendar push notifications via events.watch (requires public HTTPS webhook). */
 class CalendarWatchManager {
@@ -43,19 +44,25 @@ class CalendarWatchManager {
         }
         this._channels = [];
         this._saveState({ channels: [] });
+        log.calendar('Push watch channels stopped');
     }
 
-    async start({ calendarIds, webhookUrl }) {
+    async start({ calendarIds, webhookUrl, resolveCalendarApi } = {}) {
         await this.stop();
         if (!webhookUrl || !calendarIds?.length) return;
+        this._resolveCalendarApi = resolveCalendarApi;
 
         const channels = [];
         let earliestExpiry = Infinity;
 
         for (const calendarId of calendarIds) {
             const id = crypto.randomUUID();
+            const api = resolveCalendarApi
+                ? await resolveCalendarApi(calendarId)
+                : this.calendarApi;
+            if (!api) continue;
             try {
-                const res = await this.calendarApi.events.watch({
+                const res = await api.events.watch({
                     calendarId,
                     requestBody: {
                         id,
@@ -71,9 +78,9 @@ class CalendarWatchManager {
                     expiration: exp,
                 });
                 if (exp > 0) earliestExpiry = Math.min(earliestExpiry, exp);
-                console.log(`✓ Calendar push watch registered: ${calendarId}`);
+                log.calendar(`Push watch registered for ${calendarId} → ${webhookUrl}`);
             } catch (err) {
-                console.error(`Calendar watch failed for ${calendarId}:`, err.message);
+                log.calendarError(`Watch failed for ${calendarId}: ${err.message}`);
             }
         }
 
@@ -82,16 +89,27 @@ class CalendarWatchManager {
 
         if (earliestExpiry < Infinity) {
             const renewIn = Math.max(60000, earliestExpiry - Date.now() - 3600000);
+            log.calendar(`Watch renew scheduled in ${Math.round(renewIn / 60000)} min`);
             this._renewTimer = setTimeout(() => {
-                this.start({ calendarIds, webhookUrl }).catch((e) => console.error('Calendar watch renew:', e.message));
+                log.calendar('Renewing push watch channels…');
+                this.start({
+                    calendarIds,
+                    webhookUrl,
+                    resolveCalendarApi: this._resolveCalendarApi,
+                }).catch((e) => log.calendarError(`Watch renew failed: ${e.message}`));
             }, renewIn);
         }
     }
 
-    handlePush(headers) {
-        const state = headers['x-goog-resource-state'] || headers['X-Goog-Resource-State'];
-        if (state === 'sync') return;
-        console.log(`📅 Calendar push notification (${state}) — refreshing`);
+    handlePush(headers, body) {
+        const state = headers['x-goog-resource-state'] || headers['X-Goog-Resource-State'] || 'unknown';
+        const resourceId = headers['x-goog-resource-id'] || headers['X-Goog-Resource-Id'] || '';
+        if (state === 'sync') {
+            log.calendar(`Push received (sync) — channel verified${resourceId ? ` [${resourceId.slice(0, 8)}…]` : ''}`);
+            return;
+        }
+        log.calendar(`Push received (${state}) — refreshing calendars${resourceId ? ` [${resourceId.slice(0, 8)}…]` : ''}`);
+        if (body && Object.keys(body).length) log.calendar('Push body', body);
         if (this.onChange) this.onChange(headers);
     }
 }

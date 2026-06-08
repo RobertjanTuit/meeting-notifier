@@ -1,4 +1,12 @@
 const express = require('express');
+const log = require('./orbit-log.js');
+
+function clientHint(req) {
+    return req.headers['cf-connecting-ip']
+        || String(req.headers['x-forwarded-for'] || '').split(',')[0]?.trim()
+        || req.socket?.remoteAddress
+        || 'local';
+}
 
 /**
  * Local webhook receiver for Google Calendar push, ClickUp task events, and future Datadog.
@@ -6,6 +14,12 @@ const express = require('express');
  */
 function startWebhookServer({ port = 3921, onGoogleCalendarPush, onClickUpWebhook } = {}) {
     const app = express();
+
+    app.use((req, res, next) => {
+        const from = clientHint(req);
+        log.webhook(`${req.method} ${req.path} ← ${from}`);
+        next();
+    });
 
     app.post('/orbit/webhook/google-calendar', express.json({ limit: '1mb' }), (req, res) => {
         res.status(200).send('OK');
@@ -23,7 +37,7 @@ function startWebhookServer({ port = 3921, onGoogleCalendarPush, onClickUpWebhoo
             headers: req.headers,
             rawBody: req.rawBody || JSON.stringify(req.body),
             body: req.body,
-        })).catch((err) => console.error('ClickUp webhook error:', err.message));
+        })).catch((err) => log.webhookWarn(`ClickUp handler error: ${err.message}`));
     });
 
     app.get('/orbit/webhook/health', (_req, res) => {
@@ -32,7 +46,7 @@ function startWebhookServer({ port = 3921, onGoogleCalendarPush, onClickUpWebhoo
 
     return new Promise((resolve, reject) => {
         const server = app.listen(port, '127.0.0.1', () => {
-            console.log(`✓ Webhook server listening on http://127.0.0.1:${port}`);
+            log.webhook(`Listening on http://127.0.0.1:${port}`);
             resolve(server);
         });
         server.on('error', reject);
