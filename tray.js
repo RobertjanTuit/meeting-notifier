@@ -17,6 +17,12 @@ const { AlertHub } = require('./alert-hub.js');
 const { ClickUpWatcher } = require('./clickup.js');
 const { CalendarWatchManager } = require('./calendar-watch.js');
 const { startWebhookServer } = require('./webhook-server.js');
+const {
+    CloudflareTunnelManager,
+    buildWebhookUrls,
+    checkPublicTunnelHealth,
+} = require('./cloudflare-tunnel.js');
+const log = require('./orbit-log.js');
 
 let tray = null;
 let notifier = null;
@@ -25,12 +31,21 @@ let isFlashing = false;
 let trayPaths = null;
 let logWindow = null;
 let settingsWindow = null;
+let googleSetupWindow = null;
 let configStore = null;
 let alertHub = null;
 let clickUpWatcher = null;
 let calendarWatchManager = null;
 let webhookServer = null;
+let cloudflareTunnel = null;
+let tunnelHealth = { ok: null, error: null, url: '', checkedAt: null, checking: false };
+let tunnelHealthTimer = null;
+let tunnelHealthInitialTimer = null;
+let lastTunnelHealthNotifyOk = null;
 let settingsHandlersRegistered = false;
+
+const TUNNEL_HEALTH_INTERVAL_MS = Number(process.env.ORBIT_TUNNEL_HEALTH_INTERVAL_MS) || 5 * 60 * 1000;
+const TUNNEL_HEALTH_INITIAL_DELAY_MS = Number(process.env.ORBIT_TUNNEL_HEALTH_INITIAL_DELAY_MS) || 30 * 1000;
 let hudWindow = null;
 let isQuitting = false;
 let menuIsOpen = false;
@@ -42,6 +57,7 @@ let dockShown = false;
 let hudUserPosition = null;
 let cachedAppMenu = null;
 let lastTrayIconKey = null;
+let lastConnectionIssuesKey = null;
 let sawLaunchNotification = false;
 const logBuffer = [];
 
@@ -91,6 +107,39 @@ function loadSettings(dataDir) {
     } catch {
         // first run — defaults apply
     }
+}
+
+function getUiSettings() {
+    return {
+        menuBarTitle,
+        trayIconStyle,
+        showFloatingHud,
+        pushEnabled,
+        pushAvailable: haPushConfigured(),
+        launchAtLogin: app.getLoginItemSettings().openAtLogin,
+    };
+}
+
+function applyUiSettings(patch = {}) {
+    if (patch.menuBarTitle != null) menuBarTitle = Boolean(patch.menuBarTitle);
+    if (patch.trayIconStyle === 'text' || patch.trayIconStyle === 'dot' || patch.trayIconStyle === 'ring') {
+        trayIconStyle = patch.trayIconStyle;
+    }
+    if (patch.showFloatingHud != null) showFloatingHud = Boolean(patch.showFloatingHud);
+    if (patch.pushEnabled != null) pushEnabled = Boolean(patch.pushEnabled);
+    if (patch.launchAtLogin != null) {
+        app.setLoginItemSettings({
+            openAtLogin: Boolean(patch.launchAtLogin),
+            openAsHidden: true,
+        });
+    }
+    saveSettings();
+    lastMenuSignature = null;
+    cachedAppMenu = null;
+    applyTrayIconStyle();
+    updateTrayTitle();
+    updateHudWindow();
+    if (trayPaths) refreshUI(trayPaths);
 }
 
 function saveSettings() {
@@ -235,15 +284,20 @@ async function isMeetingOpenInBrowser(meetingUrl) {
 // open) so the app can be run from the Dock without a terminal and still show
 // its logs. The original terminal output is preserved.
 const ANSI_RE = /\x1B\[[0-9;]*m/g;
+function formatLogTime(d = new Date()) {
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 function formatLogArg(a) {
     return typeof a === 'string' ? a : util.inspect(a, { depth: 3, colors: false });
 }
 function pushLog(level, args) {
     const line = args.map(formatLogArg).join(' ').replace(ANSI_RE, '');
-    logBuffer.push({ line, level });
-    if (logBuffer.length > 2000) logBuffer.shift();
+    const stamped = `${formatLogTime()} ${line}`;
+    logBuffer.push({ line: stamped, level });
+    if (logBuffer.length > 5000) logBuffer.shift();
     if (logWindow && !logWindow.isDestroyed()) {
-        logWindow.webContents.send('log-line', { line, level });
+        logWindow.webContents.send('log-line', { line: stamped, level });
     }
 }
 for (const method of ['log', 'info', 'warn', 'error']) {
@@ -285,6 +339,7 @@ function createSettingsWindow() {
         if (settingsWindow.isMinimized()) settingsWindow.restore();
         settingsWindow.show();
         settingsWindow.focus();
+        settingsWindow.webContents.send('settings:refresh');
         return settingsWindow;
     }
     settingsWindow = new BrowserWindow({
@@ -296,12 +351,40 @@ function createSettingsWindow() {
     });
     settingsWindow.loadFile(path.join(__dirname, 'assets', 'settings.html'));
     settingsWindow.on('close', (e) => {
-        if (!isQuitting) {
-            e.preventDefault();
+        if (isQuitting) return;
+        e.preventDefault();
+        if (settingsWindow.webContents.isLoading()) {
             settingsWindow.hide();
+            return;
         }
+        settingsWindow.webContents.send('settings:request-close');
     });
     return settingsWindow;
+}
+
+
+function createGoogleSetupWindow() {
+    if (googleSetupWindow && !googleSetupWindow.isDestroyed()) {
+        if (googleSetupWindow.isMinimized()) googleSetupWindow.restore();
+        googleSetupWindow.show();
+        googleSetupWindow.focus();
+        return googleSetupWindow;
+    }
+    googleSetupWindow = new BrowserWindow({
+        width: 560,
+        height: 520,
+        title: 'Orbit — Google Cloud Setup',
+        backgroundColor: '#1e1e1e',
+        webPreferences: { nodeIntegration: true, contextIsolation: false },
+    });
+    googleSetupWindow.loadFile(path.join(__dirname, 'assets', 'google-setup.html'));
+    googleSetupWindow.on('close', (e) => {
+        if (!isQuitting) {
+            e.preventDefault();
+            googleSetupWindow.hide();
+        }
+    });
+    return googleSetupWindow;
 }
 
 
@@ -309,32 +392,417 @@ function restartClickUpWatcher() {
     if (!clickUpWatcher || !configStore) return;
     clickUpWatcher.restart();
     setupClickUpWebhooks().catch((err) => console.error('ClickUp webhook setup:', err.message));
+    clickUpWatcher.warmMemberCache?.()
+        .then(() => {
+            lastMenuSignature = null;
+            if (trayPaths) refreshUI(trayPaths);
+        })
+        .catch(() => {});
+}
+
+function buildClickUpTestMenuItems() {
+    if (!clickUpWatcher) return [];
+    const cu = configStore?.getSection('clickup');
+    if (!cu?.rules?.enabled) {
+        return [{ label: 'Test ClickUp alert (disabled)', enabled: false }];
+    }
+    const people = clickUpWatcher.getWatchedPeopleLabels();
+    if (!people.length) {
+        return [{ label: 'Test ClickUp alert (no watched people)', enabled: false }];
+    }
+    return people.map((person) => ({
+        label: `Test ClickUp alert (${person.label})`,
+        click: () => {
+            clickUpWatcher.testWatchedPersonAlert(person.id)
+                .then(({ name, channelName }) => {
+                    console.log(`🧪 ClickUp test — ${name} in #${channelName}`);
+                })
+                .catch((err) => console.error('ClickUp test alert:', err.message));
+        },
+    }));
 }
 
 async function setupClickUpWebhooks() {
     if (!configStore || !clickUpWatcher) return;
-    const section = configStore.getSection('clickup');
-    const rules = section.rules || {};
-    if (!rules.enabled || !rules.webhookSecret) return;
     await ensureWebhookServer();
+    await autoRegisterClickUpWebhooks();
 }
 
 async function ensureWebhookServer() {
-    const port = Number(process.env.ORBIT_WEBHOOK_PORT) || 3921;
+    const tunnel = configStore?.getSection('tunnel');
+    const port = Number(tunnel?.localPort) || Number(process.env.ORBIT_WEBHOOK_PORT) || 3921;
     if (webhookServer) return webhookServer;
     try {
         webhookServer = await startWebhookServer({
             port,
-            onGoogleCalendarPush: (headers) => {
-                calendarWatchManager?.handlePush(headers);
+            onGoogleCalendarPush: (headers, body) => {
+                calendarWatchManager?.handlePush(headers, body);
             },
             onClickUpWebhook: (payload) => clickUpWatcher?.handleWebhook?.(payload),
         });
         return webhookServer;
     } catch (err) {
-        console.error('Webhook server failed:', err.message);
+        log.webhookWarn(`Server failed to start: ${err.message}`);
         return null;
     }
+}
+
+function syncTunnelWebhookUrls() {
+    if (!configStore) return null;
+    const tunnel = configStore.getSection('tunnel');
+    if (!tunnel.rules?.enabled || !tunnel.hostname) return null;
+
+    const urls = buildWebhookUrls(tunnel.hostname);
+    if (tunnel.rules.autoUpdateWebhookUrls === false) return urls;
+
+    const curGoogle = configStore.getSection('google').googleRules;
+    const curClickup = configStore.getSection('clickup').rules;
+
+    configStore.saveSection('google', {
+        pushWebhookUrl: urls.googleCalendar,
+        pushEnabled: true,
+    });
+    configStore.saveSection('clickup', {
+        rules: {
+            ...curClickup,
+            webhookUrl: urls.clickup,
+            ...(urls.clickup !== curClickup.webhookUrl
+                ? { webhookId: null, webhookSecret: '' }
+                : {}),
+        },
+    });
+    configStore.reloadIntoProcess();
+    return urls;
+}
+
+async function autoRegisterClickUpWebhooks() {
+    if (!configStore || !clickUpWatcher) return;
+
+    const tunnel = configStore.getSection('tunnel');
+    if (!tunnel.rules?.enabled || !tunnel.hostname || tunnel.rules.autoUpdateWebhookUrls === false) return;
+
+    const section = configStore.getSection('clickup');
+    const rules = section.rules || {};
+    if (!rules.enabled || !String(section.apiToken || '').trim()) return;
+
+    const endpoint = rules.webhookUrl || buildWebhookUrls(tunnel.hostname).clickup;
+    if (!endpoint.startsWith('https://')) return;
+    if (rules.webhookSecret && rules.webhookUrl === endpoint) return;
+
+    if (!(await ensureWebhookServer())) return;
+
+    try {
+        await clickUpWatcher.registerWebhooks(endpoint);
+        log.clickup(`Webhooks auto-registered via tunnel → ${endpoint}`);
+    } catch (err) {
+        log.clickupError(`Webhook auto-register failed: ${err.message}`);
+    }
+}
+
+async function applyTunnelWebhookHooks() {
+    const urls = syncTunnelWebhookUrls();
+    if (!urls) return null;
+
+    const tunnel = configStore.getSection('tunnel');
+    if (tunnel.rules.autoUpdateWebhookUrls === false) return urls;
+
+    log.tunnel('Webhooks auto-configured');
+    log.tunnel(`  Google → ${urls.googleCalendar}`);
+    log.tunnel(`  ClickUp → ${urls.clickup}`);
+
+    await setupCalendarPush();
+    await autoRegisterClickUpWebhooks();
+    syncConnectionStatusUI();
+
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+        settingsWindow.webContents.send('settings:refresh');
+    }
+    return urls;
+}
+
+function stopTunnelHealthMonitor() {
+    if (tunnelHealthTimer) {
+        clearInterval(tunnelHealthTimer);
+        tunnelHealthTimer = null;
+    }
+    if (tunnelHealthInitialTimer) {
+        clearTimeout(tunnelHealthInitialTimer);
+        tunnelHealthInitialTimer = null;
+    }
+}
+
+function resetTunnelHealth() {
+    tunnelHealth = { ok: null, error: null, url: '', checkedAt: null, checking: false };
+    lastTunnelHealthNotifyOk = null;
+}
+
+function tunnelHealthSnapshot() {
+    return {
+        ok: tunnelHealth.ok,
+        error: tunnelHealth.error,
+        url: tunnelHealth.url,
+        checkedAt: tunnelHealth.checkedAt,
+        checking: tunnelHealth.checking,
+    };
+}
+
+/** Active connectivity / auth problems that block fetch or webhook delivery. */
+function collectConnectionIssues() {
+    const issues = [];
+    if (!configStore) return issues;
+
+    const status = notifier?.status;
+    if (status === 'misconfigured') {
+        issues.push({ id: 'google-env', label: 'Google', detail: 'Missing credentials in .env' });
+    } else if (status === 'unauthenticated') {
+        issues.push({ id: 'google-auth', label: 'Google Calendar', detail: 'Not authenticated' });
+    } else if (status === 'authenticating') {
+        issues.push({ id: 'google-auth', label: 'Google Calendar', detail: 'Waiting for sign-in' });
+    } else if (status === 'error' && notifier?.lastError) {
+        issues.push({
+            id: 'google-error',
+            label: 'Google Calendar',
+            detail: truncate(notifier.lastError.message, 60),
+        });
+    }
+
+    const google = configStore.getSection('google');
+    if (status === 'running') {
+        for (const acct of Object.values(google.accounts || {})) {
+            if (acct.enabled === false) continue;
+            if (!acct.connected) {
+                issues.push({
+                    id: `google-${acct.id}`,
+                    label: `Google (${acct.label || acct.id})`,
+                    detail: 'Account not connected',
+                });
+            }
+        }
+    }
+    if (google.pushEnabled && !String(google.pushWebhookUrl || '').trim()) {
+        issues.push({
+            id: 'google-push-url',
+            label: 'Calendar webhooks',
+            detail: 'Push enabled but no public URL',
+        });
+    }
+
+    const tunnel = configStore.getSection('tunnel');
+    if (tunnel.rules?.enabled) {
+        if (!String(tunnel.token || '').trim()) {
+            issues.push({ id: 'tunnel-token', label: 'Tunnel', detail: 'No tunnel token configured' });
+        } else {
+            const rt = cloudflareTunnel?.getStatus();
+            if (rt?.status !== 'starting' && !rt?.running) {
+                issues.push({
+                    id: 'tunnel-process',
+                    label: 'Tunnel',
+                    detail: rt?.lastError || 'Tunnel process not running',
+                });
+            } else if (tunnelHealth.ok === false) {
+                issues.push({
+                    id: 'tunnel-health',
+                    label: 'Tunnel',
+                    detail: tunnelHealth.error || 'Public health check failed',
+                });
+            }
+        }
+    }
+
+    const clickup = configStore.getSection('clickup');
+    const cuRules = clickup.rules || {};
+    if (cuRules.enabled) {
+        if (!String(clickup.apiToken || '').trim()) {
+            issues.push({ id: 'clickup-token', label: 'ClickUp', detail: 'API token not set' });
+        }
+        const wantsTaskWebhooks = tunnel.rules?.enabled && tunnel.rules?.autoUpdateWebhookUrls !== false;
+        if (wantsTaskWebhooks && String(cuRules.webhookUrl || '').trim() && !String(cuRules.webhookSecret || '').trim()) {
+            issues.push({
+                id: 'clickup-webhook',
+                label: 'ClickUp webhooks',
+                detail: 'Task webhooks not registered with ClickUp',
+            });
+        }
+    }
+
+    return issues;
+}
+
+function hasConnectionIssues() {
+    return collectConnectionIssues().length > 0;
+}
+
+function connectionIssuesKey() {
+    return collectConnectionIssues().map((i) => `${i.id}:${i.detail}`).join('|');
+}
+
+/** Rebuild menu bar icon + dropdown when connectivity/auth issues change. */
+function syncConnectionStatusUI() {
+    const key = connectionIssuesKey();
+    if (key === lastConnectionIssuesKey) return false;
+    lastConnectionIssuesKey = key;
+    lastMenuSignature = null;
+    cachedAppMenu = null;
+    lastTrayIconKey = null;
+    if (trayPaths) refreshUI(trayPaths);
+    return true;
+}
+
+function applyTunnelHealthResult(result, { notify = true } = {}) {
+    const prevOk = tunnelHealth.ok;
+    const prevError = tunnelHealth.error;
+    tunnelHealth = {
+        ok: result.ok,
+        error: result.error || null,
+        url: result.url || '',
+        checkedAt: result.checkedAt || Date.now(),
+        checking: false,
+    };
+
+    const changed = prevOk !== tunnelHealth.ok
+        || (tunnelHealth.ok === false && result.error !== prevError);
+    if (changed) {
+        lastMenuSignature = null;
+        if (trayPaths) refreshUI(trayPaths);
+        if (settingsWindow && !settingsWindow.isDestroyed()) {
+            settingsWindow.webContents.send('settings:refresh');
+        }
+    }
+
+    if (!notify) return;
+
+    if (tunnelHealth.ok === false && lastTunnelHealthNotifyOk !== false) {
+        lastTunnelHealthNotifyOk = false;
+        if (Notification.isSupported()) {
+            new Notification({
+                title: 'Orbit — Tunnel unreachable',
+                body: tunnelHealth.error || 'Public health check failed',
+            }).show();
+        }
+        log.tunnelWarn(`Public health check failed: ${tunnelHealth.error}`);
+    } else if (tunnelHealth.ok === true && lastTunnelHealthNotifyOk === false) {
+        lastTunnelHealthNotifyOk = true;
+        log.tunnel('Public health check recovered');
+        applyTunnelWebhookHooks().catch((err) => console.error('Tunnel webhooks:', err.message));
+    } else if (tunnelHealth.ok === true) {
+        lastTunnelHealthNotifyOk = true;
+    }
+}
+
+async function runTunnelHealthCheck({ notify = true } = {}) {
+    if (!configStore) return tunnelHealthSnapshot();
+
+    const tunnel = configStore.getSection('tunnel');
+    if (!tunnel.rules?.enabled) {
+        stopTunnelHealthMonitor();
+        resetTunnelHealth();
+        lastMenuSignature = null;
+        if (trayPaths) refreshUI(trayPaths);
+        return tunnelHealthSnapshot();
+    }
+
+    const hostname = tunnel.hostname || tunnel.rules?.hostname;
+    if (!hostname) {
+        applyTunnelHealthResult({
+            ok: null,
+            error: null,
+            url: '',
+            checkedAt: Date.now(),
+        }, { notify: false });
+        return tunnelHealthSnapshot();
+    }
+
+    tunnelHealth.checking = true;
+    log.tunnel(`Running public health check for ${hostname}…`);
+    const runtime = cloudflareTunnel?.getStatus();
+    if (!runtime?.running) {
+        applyTunnelHealthResult({
+            ok: false,
+            error: runtime?.lastError || 'Tunnel process not running',
+            url: buildWebhookUrls(hostname).health,
+            checkedAt: Date.now(),
+        }, { notify });
+        return tunnelHealthSnapshot();
+    }
+
+    const result = await checkPublicTunnelHealth(hostname);
+    if (result.ok) log.tunnel(`Public health OK → ${result.url}`);
+    else log.tunnelWarn(`Public health failed → ${result.url}: ${result.error}`);
+    applyTunnelHealthResult({
+        ...result,
+        checkedAt: result.checkedAt || Date.now(),
+    }, { notify });
+    return tunnelHealthSnapshot();
+}
+
+function startTunnelHealthMonitor() {
+    stopTunnelHealthMonitor();
+    const tunnel = configStore?.getSection('tunnel');
+    if (!tunnel?.rules?.enabled) return;
+
+    tunnelHealthInitialTimer = setTimeout(() => {
+        runTunnelHealthCheck().catch((err) => console.error('Tunnel health check:', err.message));
+        tunnelHealthTimer = setInterval(() => {
+            runTunnelHealthCheck().catch((err) => console.error('Tunnel health check:', err.message));
+        }, TUNNEL_HEALTH_INTERVAL_MS);
+    }, TUNNEL_HEALTH_INITIAL_DELAY_MS);
+}
+
+function stopCloudflareTunnel() {
+    stopTunnelHealthMonitor();
+    if (cloudflareTunnel) {
+        log.tunnel('Stopping Cloudflare tunnel…');
+        cloudflareTunnel.stop();
+    }
+}
+
+async function startCloudflareTunnel() {
+    if (!configStore) return null;
+    const tunnel = configStore.getSection('tunnel');
+    if (!tunnel.rules?.enabled) {
+        stopCloudflareTunnel();
+        resetTunnelHealth();
+        return null;
+    }
+    await ensureWebhookServer();
+    await applyTunnelWebhookHooks();
+
+    if (!tunnel.token) {
+        log.tunnelWarn('Tunnel enabled but CLOUDFLARE_TUNNEL_TOKEN is not set');
+        startTunnelHealthMonitor();
+        return null;
+    }
+
+    if (!cloudflareTunnel) cloudflareTunnel = new CloudflareTunnelManager();
+
+    try {
+        log.tunnel(`Starting Cloudflare tunnel → ${tunnel.hostname || '(no hostname)'}`);
+        const status = await cloudflareTunnel.start({ token: tunnel.token });
+        log.tunnel('Tunnel connected');
+        const urls = buildWebhookUrls(tunnel.hostname);
+        if (urls.health) log.tunnel(`Public health URL: ${urls.health}`);
+        startTunnelHealthMonitor();
+        return status;
+    } catch (err) {
+        log.tunnelError(`Tunnel failed to start: ${err.message}`);
+        startTunnelHealthMonitor();
+        return { status: 'error', lastError: err.message };
+    }
+}
+
+async function restartCloudflareTunnel() {
+    resetTunnelHealth();
+    lastMenuSignature = null;
+    if (trayPaths) refreshUI(trayPaths);
+    stopCloudflareTunnel();
+    const result = await startCloudflareTunnel();
+    // Re-check soon after restart so hostname / tunnel changes reflect immediately.
+    setTimeout(() => {
+        runTunnelHealthCheck({ notify: true }).catch((err) => {
+            log.tunnelError(`Health check after restart: ${err.message}`);
+        });
+    }, 2000);
+    return result;
 }
 
 async function setupCalendarPush() {
@@ -359,6 +827,7 @@ async function setupCalendarPush() {
     await calendarWatchManager.start({
         calendarIds: google.calendarIds,
         webhookUrl: google.pushWebhookUrl,
+        resolveCalendarApi: (calendarId) => notifier?.resolveCalendarApiFor?.(calendarId),
     });
 }
 
@@ -371,20 +840,74 @@ function applySettingsRestart(flags) {
         setupCalendarPush().catch((err) => console.error('Calendar push setup:', err.message));
     }
     if (flags.clickup) restartClickUpWatcher();
+    if (flags.tunnel) restartCloudflareTunnel().catch((err) => console.error('Tunnel restart:', err.message));
 }
 
 function registerSettingsHandlers() {
     if (!configStore || settingsHandlersRegistered) return;
     settingsHandlersRegistered = true;
 
-    ipcMain.handle('settings:get', () => configStore.getAll());
+    ipcMain.on('settings:dirty-state', () => {
+        // Reserved for future menu-bar indicator.
+    });
+
+    ipcMain.on('settings:close-allowed', () => {
+        if (settingsWindow && !settingsWindow.isDestroyed()) {
+            settingsWindow.hide();
+        }
+    });
+
+    ipcMain.handle('settings:confirm-close', async (_e, { sections } = {}) => {
+        if (!settingsWindow || settingsWindow.isDestroyed()) return 'cancel';
+        const { response } = await dialog.showMessageBox(settingsWindow, {
+            type: 'warning',
+            title: 'Unsaved changes',
+            message: 'Save changes before closing?',
+            detail: sections
+                ? `Unsaved settings in: ${sections}`
+                : 'You have unsaved settings changes.',
+            buttons: ['Save', "Don't Save", 'Cancel'],
+            defaultId: 0,
+            cancelId: 2,
+        });
+        if (response === 0) return 'save';
+        if (response === 1) return 'discard';
+        return 'cancel';
+    });
+
+    ipcMain.handle('settings:get', () => {
+        configStore.syncEnvFromSources();
+        const all = configStore.getAll();
+        all.tunnel = {
+            ...all.tunnel,
+            runtime: {
+                ...(cloudflareTunnel?.getStatus() || { status: 'stopped', running: false }),
+                publicHealth: tunnelHealthSnapshot(),
+            },
+        };
+        all.ui = getUiSettings();
+        return all;
+    });
 
     ipcMain.handle('settings:save', async (_e, { section, patch }) => {
         try {
+            if (section === 'ui') {
+                applyUiSettings(patch);
+                return { ok: true, restart: {} };
+            }
+            if (section === 'tunnel') {
+                resetTunnelHealth();
+                lastMenuSignature = null;
+            }
             const { restart } = configStore.saveSection(section, patch);
             configStore.reloadIntoProcess();
             applySettingsRestart(restart);
             if (section === 'clickup') restartClickUpWatcher();
+            if (section === 'tunnel' && !restart.tunnel) {
+                runTunnelHealthCheck({ notify: true }).catch((err) => {
+                    log.tunnelError(`Health check after save: ${err.message}`);
+                });
+            }
             return { ok: true, restart };
         } catch (err) {
             return { ok: false, error: err.message };
@@ -396,11 +919,45 @@ function registerSettingsHandlers() {
         return notifier.listCalendars();
     });
 
+    ipcMain.handle('settings:clickup-browse', async (_e, { kind, search, page, credentials } = {}) => {
+        if (!clickUpWatcher) return { ok: false, error: 'ClickUp watcher not initialized' };
+        try {
+            const creds = credentials || {};
+            if (kind === 'members') {
+                const result = await clickUpWatcher.browseMembers({
+                    search: search || '',
+                    env: creds.env,
+                    apiToken: creds.apiToken,
+                    workspaceId: creds.workspaceId,
+                });
+                return { ok: true, items: result.items, hasMore: false };
+            }
+            if (kind === 'tasks') {
+                const result = await clickUpWatcher.browseTasks({
+                    search: search || '',
+                    page: page || 0,
+                    env: creds.env,
+                    apiToken: creds.apiToken,
+                    workspaceId: creds.workspaceId,
+                });
+                return { ok: true, items: result.items, hasMore: result.hasMore };
+            }
+            return { ok: false, error: `Unknown browse kind: ${kind}` };
+        } catch (err) {
+            return { ok: false, error: err.message };
+        }
+    });
+
     ipcMain.handle('settings:test', async (_e, { kind, params }) => {
         try {
             if (kind === 'light-blink' && params?.host) {
                 await notifier?.blinkLightAt?.(params.host, 1, 600);
                 return { ok: true };
+            }
+            if (kind === 'lights-discover') {
+                if (!notifier?.discoverElgatoLights) return { ok: false, error: 'Discovery not available' };
+                const lights = await notifier.discoverElgatoLights({ timeoutMs: params?.timeoutMs || 4000 });
+                return { ok: true, lights };
             }
             if (kind === 'push-gentle') {
                 await sendHaPush({ title: 'Orbit test', message: 'Gentle push from Settings', urgent: false });
@@ -422,6 +979,14 @@ function registerSettingsHandlers() {
                 return { ok: true, message: `Key configured for ${account} (${cfg.model}) — classifier not implemented yet` };
             }
             if (kind === 'datadog') return { ok: false, error: 'Datadog test not implemented yet' };
+            if (kind === 'tunnel-health') {
+                const tunnel = configStore.getSection('tunnel');
+                const host = params?.hostname || tunnel.hostname;
+                const result = await checkPublicTunnelHealth(host);
+                if (!result.ok) return { ok: false, error: result.error, url: result.url };
+                applyTunnelHealthResult(result, { notify: false });
+                return { ok: true, url: result.url, body: result.body };
+            }
             return { ok: false, error: `Unknown test: ${kind}` };
         } catch (err) {
             return { ok: false, error: err.message };
@@ -432,12 +997,29 @@ function registerSettingsHandlers() {
         try {
             if (action === 'google-connect') {
                 if (!notifier) return { ok: false, error: 'Notifier not running' };
-                await notifier.startAuthServer();
+                const accountId = params?.accountId || 'primary';
+                await notifier.startAuthServer({ accountId });
                 return { ok: true };
             }
-            if (action === 'open-help' && trayPaths) {
-                shell.openPath(trayPaths.userData ?? trayPaths.dataDir);
+            if (action === 'google-disconnect') {
+                if (!notifier) return { ok: false, error: 'Notifier not running' };
+                const accountId = params?.accountId || 'primary';
+                notifier.disconnectGoogleAccount(accountId);
                 return { ok: true };
+            }
+            if (action === 'open-help') {
+                if (params?.topic === 'google-gcp') {
+                    createGoogleSetupWindow();
+                    return { ok: true };
+                }
+                if (trayPaths) {
+                    shell.openPath(trayPaths.userData ?? trayPaths.dataDir);
+                }
+                return { ok: true };
+            }
+            if (action === 'tunnel-restart') {
+                const status = await restartCloudflareTunnel();
+                return { ok: true, status: status || cloudflareTunnel?.getStatus() };
             }
             if (action === 'clickup-register-webhook') {
                 if (!clickUpWatcher) return { ok: false, error: 'ClickUp watcher not initialized' };
@@ -727,7 +1309,7 @@ function createColoredDotImage(hex, size = 16) {
     return createOrbitIconImage(hex, null, size);
 }
 
-function createOrbitIconImage(hex, arcFraction, logicalSize = 18, { alert = false } = {}) {
+function createOrbitIconImage(hex, arcFraction, logicalSize = 18, { alert = false, disconnected = false } = {}) {
     const scale = 2;
     const size = logicalSize * scale;
     const [r, g, b] = hexToRgb(hex);
@@ -776,6 +1358,19 @@ function createOrbitIconImage(hex, arcFraction, logicalSize = 18, { alert = fals
         }
     }
 
+    if (disconnected) {
+        const warnR = size * 0.17;
+        const wx = size * 0.8;
+        const wy = size * 0.2;
+        for (let y = 0; y < size; y++) {
+            for (let x = 0; x < size; x++) {
+                if (Math.hypot(x - wx + 0.5, y - wy + 0.5) <= warnR) {
+                    paint(x, y, 255, 149, 0);
+                }
+            }
+        }
+    }
+
     return nativeImage.createFromBitmap(buf, { width: size, height: size, scaleFactor: scale });
 }
 
@@ -808,25 +1403,28 @@ function orbitVisualState() {
     return { color, arc: 0, alert: false };
 }
 
-function orbitIconCacheKey(state) {
+function orbitIconCacheKey(state, { disconnected = false } = {}) {
     const prefix = trayIconStyle;
+    const dc = disconnected ? '-dc' : '';
     if (state.alert) {
-        return `${prefix}-alert-${state.color}-${Math.floor((state.arc ?? 0) * 60)}`;
+        return `${prefix}-alert-${state.color}-${Math.floor((state.arc ?? 0) * 60)}${dc}`;
     }
-    if (state.arc == null) return `${prefix}-dot-${state.color}`;
-    if (state.arc > 1 / 60) return `${prefix}-arc-${state.color}-${Math.floor(state.arc * 60)}`;
-    return `${prefix}-arc-${state.color}-${Math.floor(state.arc * 360)}`;
+    if (state.arc == null) return `${prefix}-dot-${state.color}${dc}`;
+    if (state.arc > 1 / 60) return `${prefix}-arc-${state.color}-${Math.floor(state.arc * 60)}${dc}`;
+    return `${prefix}-arc-${state.color}-${Math.floor(state.arc * 360)}${dc}`;
 }
 
 function trayImageForState() {
     const state = orbitVisualState();
-    return createOrbitIconImage(state.color, state.arc, 18, { alert: state.alert });
+    const disconnected = !state.alert && hasConnectionIssues();
+    return createOrbitIconImage(state.color, state.arc, 18, { alert: state.alert, disconnected });
 }
 
 function updateTrayIcon() {
     if (!tray || tray.isDestroyed()) return;
     const state = orbitVisualState();
-    const iconKey = orbitIconCacheKey(state);
+    const disconnected = !state.alert && hasConnectionIssues();
+    const iconKey = orbitIconCacheKey(state, { disconnected });
     if (iconKey === lastTrayIconKey) return;
     lastTrayIconKey = iconKey;
     tray.setImage(trayImageForState());
@@ -1125,6 +1723,21 @@ async function startDismissPolling() {
     }, 3000);
 }
 
+async function testMeetingAlert() {
+    const meeting = {
+        summary: 'Test meeting (Orbit)',
+        start: { dateTime: new Date().toISOString() },
+    };
+    const { title, message, urgent } = pushTextForKind('start', meeting);
+    console.log('🧪 Test meeting alert — pulse, then overdue UI (click tray or Dismiss alert to stop)');
+    if (alertHub) {
+        await alertHub.deliverMeeting({ kind: 'start', meeting, title, message, urgent, quick: true });
+    } else if (notifier?.pulseAlert) {
+        await notifier.pulseAlert(2, 600, { lights: true, sound: true, flash: true });
+    }
+    startAlert(meeting);
+}
+
 function startAlert(meeting) {
     // (Re)start a blinking red overdue alert for the given meeting.
     alert.active = true;
@@ -1211,6 +1824,7 @@ function setTrayTitleIfChanged(title) {
 }
 
 function updateTrayTitle() {
+    syncConnectionStatusUI();
     if (tray) {
         let title = '';
         let tooltip = 'Orbit';
@@ -1241,6 +1855,18 @@ function updateTrayTitle() {
                     title = ` ${truncate(summary, 18)}  ${countdown}${bar ? ' ' + bar : ''}`;
                 }
                 tooltip = `Next: ${summary} (${cal}) — ${countdown} (${start.format('h:mm a')})${inMeeting ? ' — in a meeting now' : ''}`;
+            }
+        }
+
+        const connectionIssues = collectConnectionIssues();
+        if (connectionIssues.length && !alert.active) {
+            const issueTip = connectionIssues.map((i) => `${i.label}: ${i.detail}`).join(' · ');
+            tooltip = tooltip === 'Orbit' ? issueTip : `${issueTip} · ${tooltip}`;
+            if (menuBarTitle) {
+                const issueLabel = connectionIssues.length === 1
+                    ? truncate(connectionIssues[0].detail, 16)
+                    : `${connectionIssues.length} disconnected`;
+                title = ` ⚠ ${issueLabel}${title}`;
             }
         }
 
@@ -1282,13 +1908,12 @@ function menuStructureSignature(paths) {
         nextLink: !!next?.videoEntryPoint?.uri,
         currentLink: !!current?.videoEntryPoint?.uri,
         lights: notifier?.keyLights?.length ?? 0,
-        pushEnabled,
-        menuBarTitle,
-        trayIconStyle,
-        showFloatingHud,
         haPush: haPushConfigured(),
         login: app.getLoginItemSettings().openAtLogin,
         dataDir: paths?.dataDir,
+        tunnelHealth: tunnelHealth.ok,
+        tunnelHealthErr: tunnelHealth.error,
+        connectionIssues: collectConnectionIssues().map((i) => `${i.id}:${i.detail}`).join('|'),
     });
 }
 
@@ -1335,6 +1960,17 @@ function buildMenu(paths) {
             enabled: false,
         });
         items.push({ label: 'Dismiss alert', click: () => stopAlert() });
+        items.push({ type: 'separator' });
+    }
+
+    const connectionIssues = collectConnectionIssues();
+    if (connectionIssues.length) {
+        for (const issue of connectionIssues) {
+            items.push({
+                label: `⚠ ${issue.label}: ${truncate(issue.detail, 44)}`,
+                enabled: false,
+            });
+        }
         items.push({ type: 'separator' });
     }
 
@@ -1427,189 +2063,131 @@ function buildMenu(paths) {
         enabled: notifier?.status === 'running',
     });
     items.push({
-        label: 'Test blink',
-        click: () => notifier?.blinkLight(1, 600),
-        enabled: lightCount > 0,
-    });
-    items.push({
-        label: 'Test screen flash',
-        click: () => flashScreen(2, 600),
-    });
-    items.push({
-        label: 'Fix Audio',
-        enabled: process.platform === 'darwin',
-        click: async () => {
-            console.log('🔊 Fix Audio — restarting Wave Link and resetting devices…');
-            const result = await fixAudio();
-            for (const step of result.steps) console.log(`  ✓ ${step}`);
-            if (result.ok) {
-                console.log('🔊 Fix Audio complete');
-            } else {
-                console.error('🔊 Fix Audio failed:', result.error);
-                dialog.showMessageBoxSync({
-                    type: 'warning',
-                    title: 'Fix Audio failed',
-                    message: result.error || 'Unknown error',
-                    detail: result.steps.length
-                        ? `Completed before failure:\n${result.steps.join('\n')}`
-                        : 'Install switchaudio-osx: brew install switchaudio-osx',
-                });
-            }
-        },
-    });
-    items.push({
-        label: 'Test overdue + phone push',
-        enabled: haPushConfigured(),
-        click: () => {
-            const meeting = notifier?.nextMeeting || { summary: 'Test meeting' };
-            startAlert(meeting);
-            const { title, message, urgent } = pushTextForKind('start', meeting);
-            sendHaPush({
-                title,
-                message,
-                urgent,
-                url: meeting?.videoEntryPoint?.uri,
-            });
-        },
-    });
-    items.push({
-        label: 'Test phone push (gentle)',
-        enabled: haPushConfigured(),
-        click: () => sendHaPush({
-            title: 'Orbit test',
-            message: 'Gentle reminder channel',
-            urgent: false,
-        }),
-    });
-    items.push({
-        label: 'Test overdue alert (Mac only)',
-        click: () => startAlert(notifier?.nextMeeting || { summary: 'Test meeting' }),
-    });
-    items.push({
-        label: 'Menu bar icon hidden?',
-        click: () => {
-            dialog.showMessageBoxSync({
-                type: 'info',
-                title: 'Find Orbit in the menu bar',
-                message: 'macOS may hide menu bar icons when space is tight (especially on notched MacBooks).',
-                detail:
-                    '1. Look for a small circle icon on the right side of the menu bar.\n\n' +
-                    '2. Click the ◁ or >> control at the right edge of the menu bar to reveal hidden icons.\n\n' +
-                    '3. System Settings → Control Center → Menu Bar Only → drag items you don\'t need into Control Center.\n\n' +
-                    '4. Quit other menu bar apps to free space.\n\n' +
-                    'The meeting countdown also appears in this dropdown menu even if the title is hidden.',
-                buttons: ['OK'],
-            });
-        },
-    });
-    items.push({
         label: 'Settings…',
         click: () => createSettingsWindow(),
     });
     items.push({
-        label: 'Show console window',
-        click: () => createLogWindow(),
-    });
-    items.push({
-        label: 'Open events log',
-        click: () => shell.openPath(path.join(paths.dataDir, 'events-log.json')),
-    });
-    items.push({
-        label: 'Open config folder',
-        click: () => shell.openPath(paths.userData ?? path.dirname(paths.credentialsPath)),
-    });
-
-    items.push({ type: 'separator' });
-
-    items.push({
-        label: 'Show countdown in menu bar',
-        type: 'checkbox',
-        checked: menuBarTitle,
-        click: (item) => {
-            menuBarTitle = item.checked;
-            saveSettings();
-            updateTrayTitle();
-        },
-    });
-
-    items.push({
-        label: 'Menu bar icon',
+        label: 'Diagnostics…',
         submenu: [
             {
-                label: 'Orbit countdown (last hour)',
-                type: 'radio',
-                checked: trayIconStyle === 'text',
+                label: 'Test blink',
+                click: () => notifier?.blinkLight(1, 600),
+                enabled: lightCount > 0,
+            },
+            {
+                label: 'Test screen flash',
+                click: () => flashScreen(2, 600),
+            },
+            {
+                label: 'Test meeting alert',
                 click: () => {
-                    trayIconStyle = 'text';
-                    saveSettings();
-                    applyTrayIconStyle();
+                    testMeetingAlert().catch((err) => console.error('Test meeting alert:', err.message));
+                },
+            },
+            ...buildClickUpTestMenuItems(),
+            {
+                label: 'Fix Audio',
+                enabled: process.platform === 'darwin',
+                click: async () => {
+                    console.log('🔊 Fix Audio — restarting Wave Link and resetting devices…');
+                    const result = await fixAudio();
+                    for (const step of result.steps) console.log(`  ✓ ${step}`);
+                    if (result.ok) {
+                        console.log('🔊 Fix Audio complete');
+                    } else {
+                        console.error('🔊 Fix Audio failed:', result.error);
+                        dialog.showMessageBoxSync({
+                            type: 'warning',
+                            title: 'Fix Audio failed',
+                            message: result.error || 'Unknown error',
+                            detail: result.steps.length
+                                ? `Completed before failure:\n${result.steps.join('\n')}`
+                                : 'Install switchaudio-osx: brew install switchaudio-osx',
+                        });
+                    }
+                },
+            },
+            { type: 'separator' },
+            {
+                label: 'Test overdue + phone push',
+                enabled: haPushConfigured(),
+                click: () => {
+                    const meeting = notifier?.nextMeeting || { summary: 'Test meeting' };
+                    startAlert(meeting);
+                    const { title, message, urgent } = pushTextForKind('start', meeting);
+                    sendHaPush({
+                        title,
+                        message,
+                        urgent,
+                        url: meeting?.videoEntryPoint?.uri,
+                    });
                 },
             },
             {
-                label: 'Dot only (calendar color)',
-                type: 'radio',
-                checked: trayIconStyle === 'dot',
+                label: 'Test phone push (gentle)',
+                enabled: haPushConfigured(),
+                click: () => sendHaPush({
+                    title: 'Orbit test',
+                    message: 'Gentle reminder channel',
+                    urgent: false,
+                }),
+            },
+            {
+                label: 'Test overdue alert (Mac only)',
+                click: () => startAlert(notifier?.nextMeeting || { summary: 'Test meeting' }),
+            },
+            { type: 'separator' },
+            {
+                label: 'Show console window',
+                click: () => createLogWindow(),
+            },
+            {
+                label: 'Open events log',
+                click: () => shell.openPath(path.join(paths.dataDir, 'events-log.json')),
+            },
+            {
+                label: 'Open config folder',
+                click: () => shell.openPath(paths.userData ?? path.dirname(paths.credentialsPath)),
+            },
+            { type: 'separator' },
+            {
+                label: 'Run tunnel health check',
+                enabled: Boolean(configStore?.getSection('tunnel')?.rules?.enabled),
+                click: () => runTunnelHealthCheck({ notify: false }).catch((err) => {
+                    console.error('Tunnel health check:', err.message);
+                }),
+            },
+            {
+                label: 'Open Tunnel settings',
+                click: () => createSettingsWindow(),
+            },
+            { type: 'separator' },
+            {
+                label: 'Menu bar icon hidden?',
                 click: () => {
-                    trayIconStyle = 'dot';
-                    saveSettings();
-                    applyTrayIconStyle();
+                    dialog.showMessageBoxSync({
+                        type: 'info',
+                        title: 'Find Orbit in the menu bar',
+                        message: 'macOS may hide menu bar icons when space is tight (especially on notched MacBooks).',
+                        detail:
+                            '1. Look for a small circle icon on the right side of the menu bar.\n\n' +
+                            '2. Click the ◁ or >> control at the right edge of the menu bar to reveal hidden icons.\n\n' +
+                            '3. System Settings → Control Center → Menu Bar Only → drag items you don\'t need into Control Center.\n\n' +
+                            '4. Quit other menu bar apps to free space.\n\n' +
+                            'The meeting countdown also appears in this dropdown menu even if the title is hidden.',
+                        buttons: ['OK'],
+                    });
                 },
             },
             {
-                label: 'Full ring + countdown',
-                type: 'radio',
-                checked: trayIconStyle === 'ring',
-                click: () => {
-                    trayIconStyle = 'ring';
-                    saveSettings();
-                    applyTrayIconStyle();
-                },
+                label: 'Reload menu bar icon',
+                click: () => recreateTray(),
+            },
+            {
+                label: 'Fix menu bar visibility (macOS 26)',
+                click: () => fixMenuBarVisibility(),
             },
         ],
-    });
-
-    items.push({
-        label: 'Reload menu bar icon',
-        click: () => recreateTray(),
-    });
-
-    items.push({
-        label: 'Fix menu bar visibility (macOS 26)',
-        click: () => fixMenuBarVisibility(),
-    });
-
-    items.push({
-        label: 'Show floating countdown',
-        type: 'checkbox',
-        checked: showFloatingHud,
-        click: (item) => {
-            showFloatingHud = item.checked;
-            saveSettings();
-            updateHudWindow();
-        },
-    });
-
-    items.push({
-        label: 'Push to phone when away',
-        type: 'checkbox',
-        checked: pushEnabled,
-        enabled: haPushConfigured(),
-        click: (item) => {
-            pushEnabled = item.checked;
-            saveSettings();
-        },
-    });
-
-    items.push({
-        label: 'Launch at login',
-        type: 'checkbox',
-        checked: app.getLoginItemSettings().openAtLogin,
-        click: (item) => {
-            app.setLoginItemSettings({
-                openAtLogin: item.checked,
-                openAsHidden: true,
-            });
-        },
     });
 
     items.push({ type: 'separator' });
@@ -1642,7 +2220,14 @@ app.whenReady().then(() => {
 
     const paths = resolvePaths();
     trayPaths = paths;
-    configStore = createConfigStore(paths.dataDir);
+    const extraEnvSources = [];
+    if (app.isPackaged) {
+        extraEnvSources.push(
+            path.join(app.getPath('appData'), 'meeting-notifier', '.env'),
+            path.join(app.getPath('home'), 'meeting-notifier', '.env'),
+        );
+    }
+    configStore = createConfigStore(paths.dataDir, { extraEnvSources });
     loadSettings(paths.dataDir);
     initPresenceTracking();
 
@@ -1694,7 +2279,7 @@ app.whenReady().then(() => {
     notifier.on('status', (status) => {
         refreshUI(paths);
         if (status === 'running') {
-            setupCalendarPush().catch((err) => console.error('Calendar push setup:', err.message));
+            applyTunnelWebhookHooks().catch((err) => console.error('Tunnel webhooks:', err.message));
         }
     });
     notifier.on('meeting-update', () => refreshUI(paths));
@@ -1729,6 +2314,7 @@ app.whenReady().then(() => {
     refreshUI(paths);
     createHudWindow();
     updateHudWindow();
+    log.orbit('Started — use menu → Show console window to watch live activity');
 
     if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
         const result = dialog.showMessageBoxSync({
@@ -1750,8 +2336,9 @@ app.whenReady().then(() => {
 
     try {
         notifier.start();
-        restartClickUpWatcher();
-        setupCalendarPush().catch((err) => console.error('Calendar push setup:', err.message));
+        startCloudflareTunnel()
+            .catch((err) => console.error('Tunnel startup:', err.message))
+            .finally(() => restartClickUpWatcher());
     } catch (error) {
         dialog.showErrorBox('Failed to start Orbit', error.message);
     }
@@ -1798,6 +2385,13 @@ function cleanup() {
     if (alert.browserTimer) clearInterval(alert.browserTimer);
     stopDismissPolling();
     notifier?.stop();
+    stopTunnelHealthMonitor();
+    stopCloudflareTunnel();
+    if (webhookServer) {
+        log.webhook('Stopping webhook server…');
+        try { webhookServer.close(); } catch { /* noop */ }
+        webhookServer = null;
+    }
     destroyFlashWindows();
     if (tray && !tray.isDestroyed()) {
         tray.destroy();
