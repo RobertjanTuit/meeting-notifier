@@ -65,6 +65,8 @@
         }
         .badge.ok { background: #1e3a1e; color: #89d185; }
         .badge.no { background: #3a1e1e; color: #f48771; }
+        .help.ok { color: #89d185; }
+        .help.err { color: #f48771; }
         .help { font-size: 12px; color: #888; margin: 8px 0 14px; }
         .help a { color: #3794ff; }
         .cal-list { max-height: 180px; overflow-y: auto; border: 1px solid #444; border-radius: 4px; padding: 8px; background: #2d2d2d; }
@@ -83,8 +85,63 @@
         #statusbar.ok { color: #89d185; }
         #statusbar.err { color: #f48771; }
         #statusbar.busy { color: #dcdcaa; }
+        #statusbar.unsaved { color: #dcdcaa; }
+        nav button.unsaved { color: #dcdcaa; }
+        nav button.unsaved::after { content: ' •'; }
+        button[data-save].unsaved {
+            box-shadow: 0 0 0 1px #dcdcaa;
+            background: #3d3a1e;
+        }
         .stub-msg { font-size: 12px; color: #dcdcaa; font-style: italic; }
         .rule-grid label { display: block; margin-bottom: 8px; font-size: 12px; color: #ccc; }
+        .google-account-card {
+            border: 1px solid #444; border-radius: 6px; padding: 12px; margin-bottom: 12px; background: #2a2a2a;
+        }
+        .google-account-card h3 {
+            margin: 0 0 10px; font-size: 13px; font-weight: 600; color: #ddd;
+            display: flex; align-items: center; justify-content: space-between; gap: 8px;
+        }
+        .google-account-card .ga-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+        .wlp-root { margin-bottom: 16px; }
+        .wlp-watching-wrap { margin-bottom: 10px; }
+        .wlp-watching-label { font-size: 11px; color: #aaa; margin-bottom: 6px; }
+        .wlp-watching-list { display: flex; flex-direction: column; gap: 4px; }
+        .wlp-watched {
+            display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+            background: #2d2d2d; border: 1px solid #444; border-radius: 4px; font-size: 12px;
+        }
+        .wlp-watched-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #ddd; }
+        .wlp-watched-sub { color: #777; font-size: 11px; flex-shrink: 0; }
+        .wlp-remove {
+            background: none; border: none; color: #aaa; cursor: pointer; padding: 0 4px;
+            font-size: 16px; line-height: 1;
+        }
+        .wlp-remove:hover { color: #f48771; }
+        .wlp-watching-empty { font-size: 11px; color: #777; margin: 0 0 8px; font-style: italic; }
+        .wlp-search { width: 100%; margin-bottom: 6px; padding: 6px 8px; background: #3c3c3c; border: 1px solid #555; border-radius: 4px; color: #d4d4d4; font: inherit; }
+        .wlp-search:focus { outline: 1px solid #0e639c; border-color: #0e639c; }
+        .wlp-viewport {
+            position: relative; overflow-y: auto; border: 1px solid #444; border-radius: 4px;
+            background: #2d2d2d;
+        }
+        .wlp-spacer { width: 1px; pointer-events: none; }
+        .wlp-rows { position: absolute; left: 0; right: 0; top: 0; }
+        .wlp-row {
+            position: absolute; left: 0; right: 0; height: 36px; display: flex; align-items: center; gap: 8px;
+            padding: 0 10px; font-size: 12px; color: #ccc; border-bottom: 1px solid #333;
+        }
+        .wlp-row:hover { background: #353535; }
+        .wlp-row.added { opacity: 0.55; }
+        .wlp-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .wlp-sub { color: #777; font-size: 11px; flex-shrink: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
+        .wlp-add {
+            flex-shrink: 0; background: #0e639c; color: #fff; border: none; padding: 3px 10px;
+            border-radius: 3px; cursor: pointer; font-size: 11px;
+        }
+        .wlp-add:hover:not([disabled]) { background: #1177bb; }
+        .wlp-add[disabled] { background: #444; color: #888; cursor: default; }
+        .wlp-empty, .wlp-status { font-size: 11px; color: #888; padding: 8px 10px; }
+        .wlp-status.err { color: #f48771; }
     </style>
 </head>
 <body>
@@ -98,6 +155,7 @@
             <button type="button" class="tab" data-tab="email">Email</button>
             <button type="button" class="tab" data-tab="datadog">Datadog</button>
             <button type="button" class="tab" data-tab="alerts">Alerts</button>
+            <button type="button" class="tab" data-tab="tunnel">Tunnel</button>
             <button type="button" class="tab" data-tab="general">General</button>
         </nav>
         <main>
@@ -106,7 +164,11 @@
                 <h2>Key Lights</h2>
                 <p class="desc">Elgato Key Light hostnames or IP addresses.</p>
                 <div id="lights-list"></div>
-                <button type="button" class="secondary small" id="lights-add">+ Add light</button>
+                <div style="display:flex;gap:8px;margin:8px 0">
+                    <button type="button" class="secondary small" id="lights-detect">Detect all lights</button>
+                    <button type="button" class="secondary small" id="lights-add">+ Add light</button>
+                </div>
+                <p class="help">Scans the local network for Elgato Key Lights (mDNS on macOS).</p>
                 <div class="actions">
                     <button type="button" data-save="lights">Save</button>
                 </div>
@@ -119,17 +181,18 @@
                 <label class="field"><span>Client ID</span><input type="text" id="google-clientId" autocomplete="off" /></label>
                 <label class="field"><span>Client secret</span><input type="password" id="google-clientSecret" autocomplete="off" /></label>
                 <label class="field"><span>Redirect URI</span><input type="text" id="google-redirectUri" autocomplete="off" /></label>
+                <span class="field"><span>Google accounts</span></span>
+                <p class="help">Each account stores OAuth tokens in its own credentials file. Connect work and personal separately.</p>
+                <div id="google-accounts-list"></div>
                 <span class="field"><span>Calendars</span></span>
                 <div class="cal-list" id="google-calendars"><em style="color:#666">Loading calendars…</em></div>
-                <div class="badges" id="google-accounts"></div>
                 <label class="field"><span>Poll interval (seconds)</span><input type="number" id="google-pollInterval" min="15" step="1" value="60" /></label>
                 <p class="help">Regular background sync. Default: every 60 seconds.</p>
                 <label class="inline"><input type="checkbox" id="google-pushEnabled" /> Push notifications (instant refresh on calendar changes)</label>
                 <label class="field"><span>Public webhook URL</span><input type="text" id="google-pushWebhookUrl" placeholder="https://your-tunnel/orbit/webhook/google-calendar" /></label>
-                <p class="help">Requires a tunnel (Nabu Casa, Cloudflare) to port <code>3921</code> on this Mac. Orbit registers Google <code>events.watch</code> channels to this URL.</p>
+                <p class="help">Requires a tunnel to port <code>3921</code>. With <strong>Tunnel → Automatically configure webhooks</strong> enabled, this URL and push are set for you.</p>
                 <p class="help">Need your own GCP project? See the <a href="#" id="google-help-link">Google Cloud setup guide</a>.</p>
                 <div class="actions">
-                    <button type="button" id="google-connect">Connect Google</button>
                     <button type="button" data-save="google">Save</button>
                 </div>
             </section>
@@ -171,10 +234,14 @@
                 <label class="field"><span>API token</span><input type="password" id="clickup-token" autocomplete="off" /></label>
                 <label class="field"><span>Workspace ID</span><input type="text" id="clickup-workspaceId" /></label>
                 <label class="field"><span>Poll interval (seconds)</span><input type="number" id="clickup-pollInterval" min="10" step="1" /></label>
-                <label class="field"><span>Watch people (comma-separated user IDs)</span><input type="text" id="clickup-watchPeople" placeholder="12345, 67890" /></label>
-                <label class="field"><span>Watch task tags (comma-separated)</span><input type="text" id="clickup-taskTagMatch" placeholder="urgent, orbit" /></label>
+                <span class="field"><span>Watch people</span></span>
+                <p class="help">People on the watch list get DM/mention rules. Search below to add; × to remove.</p>
+                <div id="clickup-people-picker"></div>
+                <span class="field"><span>Watch tasks</span></span>
+                <p class="help">Task webhook events for selected tasks only (empty = all tasks). Scroll search results to load more.</p>
+                <div id="clickup-tasks-picker"></div>
                 <label class="field"><span>Public webhook URL</span><input type="text" id="clickup-webhookUrl" placeholder="https://your-tunnel/orbit/webhook/clickup" /></label>
-                <p class="help">Task events (comments, assignee, tags) need an HTTPS tunnel to port <code>3921</code>. Chat uses polling above.</p>
+                <p class="help">Task events need an HTTPS tunnel to port <code>3921</code>. With tunnel auto-config enabled, Orbit registers webhooks for you. Chat uses polling above.</p>
                 <p class="help" id="clickup-webhook-status"></p>
                 <div class="rule-grid">
                     <span class="field"><span>Rules</span></span>
@@ -261,15 +328,50 @@
                 </div>
             </section>
 
+            <!-- Tunnel -->
+            <section class="panel" id="panel-tunnel">
+                <h2>Cloudflare Tunnel</h2>
+                <p class="desc">Expose Orbit webhooks to the internet with a stable HTTPS URL.</p>
+                <p class="help" id="tunnel-runtime-status">Status: unknown</p>
+                <label class="inline"><input type="checkbox" id="tunnel-enabled" /> Start tunnel when Orbit launches</label>
+                <label class="field"><span>Tunnel token</span><input type="password" id="tunnel-token" autocomplete="off" placeholder="From Cloudflare Zero Trust → Tunnels" /></label>
+                <label class="field"><span>Public hostname</span><input type="text" id="tunnel-hostname" placeholder="orbit.example.com" /></label>
+                <label class="field"><span>Local webhook port</span><input type="number" id="tunnel-port" min="1" max="65535" value="3921" /></label>
+                <label class="inline"><input type="checkbox" id="tunnel-auto-urls" checked /> Automatically configure Google &amp; ClickUp webhooks from hostname</label>
+                <p class="help">When enabled, Orbit sets the public webhook URLs, turns on Google Calendar push, and registers ClickUp webhooks when the tunnel starts.</p>
+                <p class="help">The hostname here is what Orbit uses for webhook URLs and health checks — it must match your Cloudflare tunnel route. <strong>Click Save</strong> after changes; health is re-checked automatically.</p>
+                <p class="help">In Cloudflare, route your hostname to <code>http://localhost:3921</code> (or the port above).</p>
+                <div class="help" id="tunnel-url-preview"></div>
+                <div class="actions">
+                    <button type="button" class="secondary" id="tunnel-test">Test public health</button>
+                    <button type="button" class="secondary" id="tunnel-restart">Restart tunnel</button>
+                    <button type="button" data-save="tunnel">Save</button>
+                </div>
+            </section>
+
             <!-- General -->
             <section class="panel" id="panel-general">
                 <h2>General</h2>
-                <p class="desc">Timezone and audio routing.</p>
+                <p class="desc">Menu bar, notifications, timezone, and audio.</p>
+                <span class="field"><span>Menu bar &amp; display</span></span>
+                <label class="inline"><input type="checkbox" id="ui-menuBarTitle" /> Show countdown in menu bar</label>
+                <label class="field"><span>Menu bar icon</span>
+                    <select id="ui-trayIconStyle">
+                        <option value="text">Orbit countdown (last hour)</option>
+                        <option value="dot">Dot only (calendar color)</option>
+                        <option value="ring">Full ring + countdown</option>
+                    </select>
+                </label>
+                <label class="inline"><input type="checkbox" id="ui-showFloatingHud" /> Show floating countdown</label>
+                <label class="inline"><input type="checkbox" id="ui-pushEnabled" /> Push to phone when away</label>
+                <p class="help" id="ui-push-help">Requires Home Assistant URL, token, and notify target.</p>
+                <label class="inline"><input type="checkbox" id="ui-launchAtLogin" /> Launch at login</label>
+                <span class="field"><span>Timezone &amp; audio</span></span>
                 <label class="field"><span>Timezone</span><input type="text" id="general-timezone" placeholder="America/Los_Angeles" /></label>
                 <label class="field"><span>Audio output device</span><input type="text" id="general-audioOutput" placeholder="BlackHole 2ch" /></label>
                 <label class="field"><span>Audio input device</span><input type="text" id="general-audioInput" placeholder="Elgato Wave Link Chat Mix" /></label>
                 <div class="actions">
-                    <button type="button" data-save="general">Save</button>
+                    <button type="button" data-save="general-ui">Save</button>
                 </div>
             </section>
         </main>
@@ -277,11 +379,31 @@
     <div id="statusbar">Ready</div>
 
     <script>
+        const path = require('path');
         const { ipcRenderer } = require('electron');
+        const { WatchListPicker } = require(path.join(__dirname, 'virtual-picker.js'));
 
         let settings = {};
         let calendarOptions = [];
         let statusTimer = null;
+        let savedSnapshot = {};
+        let isPopulating = false;
+        let dirtyCheckTimer = null;
+        let clickupPeoplePicker = null;
+        let clickupTasksPicker = null;
+
+        const SECTION_LABELS = {
+            lights: 'Lights',
+            google: 'Google',
+            homeassistant: 'Home Assistant',
+            clickup: 'ClickUp',
+            email: 'Email',
+            datadog: 'Datadog',
+            alerts: 'Alerts',
+            tunnel: 'Tunnel',
+            general: 'General',
+            ui: 'General',
+        };
 
         const statusEl = document.getElementById('statusbar');
         const SOURCE_KEYS = ['meetings', 'clickup', 'email', 'datadog'];
@@ -341,9 +463,11 @@
                 row.querySelector('.light-remove').onclick = () => {
                     row.remove();
                     if (!list.querySelector('.row')) renderLights(['']);
+                    scheduleDirtyCheck();
                 };
                 list.appendChild(row);
             });
+            scheduleDirtyCheck();
         }
 
         function gatherLights() {
@@ -358,16 +482,176 @@
             return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
         }
 
+        function effectiveSecret(inputValue, fallback) {
+            const v = String(inputValue ?? '').trim();
+            return v || fallback || '';
+        }
+
+        function stableStringify(value) {
+            return JSON.stringify(value, (_key, v) => {
+                if (v && typeof v === 'object' && !Array.isArray(v)) {
+                    return Object.keys(v).sort().reduce((acc, k) => {
+                        acc[k] = v[k];
+                        return acc;
+                    }, {});
+                }
+                return v;
+            });
+        }
+
+        function snapshotAll() {
+            const snap = {};
+            for (const [section, gather] of Object.entries(gatherers)) {
+                snap[section] = gather();
+            }
+            return snap;
+        }
+
+        function getDirtySections() {
+            const current = snapshotAll();
+            const dirty = [];
+            for (const section of Object.keys(gatherers)) {
+                if (stableStringify(current[section]) !== stableStringify(savedSnapshot[section])) {
+                    dirty.push(section);
+                }
+            }
+            return dirty;
+        }
+
+        function isDirty() {
+            return getDirtySections().length > 0;
+        }
+
+        function updateDirtyUI() {
+            const dirty = getDirtySections();
+            const dirtySet = new Set(dirty);
+            document.querySelectorAll('[data-save]').forEach((btn) => {
+                const saveKey = btn.dataset.save;
+                const unsaved = saveKey === 'general-ui'
+                    ? dirtySet.has('general') || dirtySet.has('ui')
+                    : dirtySet.has(saveKey);
+                btn.classList.toggle('unsaved', unsaved);
+            });
+            document.querySelectorAll('nav .tab').forEach((tab) => {
+                const tabSections = tab.dataset.tab === 'general' ? ['general', 'ui'] : [tab.dataset.tab];
+                tab.classList.toggle('unsaved', tabSections.some((s) => dirtySet.has(s)));
+            });
+            document.title = dirty.length ? 'Orbit — Settings •' : 'Orbit — Settings';
+            if (dirty.length) {
+                const names = dirty.map((s) => SECTION_LABELS[s] || s).join(', ');
+                statusEl.textContent = `Unsaved changes — ${names}`;
+                statusEl.className = 'unsaved';
+                if (statusTimer) clearTimeout(statusTimer);
+            } else if (!statusTimer) {
+                statusEl.textContent = 'Ready';
+                statusEl.className = '';
+            }
+            ipcRenderer.send('settings:dirty-state', { dirty: dirty.length > 0, sections: dirty });
+        }
+
+        function resetSnapshot() {
+            savedSnapshot = snapshotAll();
+            updateDirtyUI();
+        }
+
+        function scheduleDirtyCheck() {
+            if (isPopulating) return;
+            if (dirtyCheckTimer) clearTimeout(dirtyCheckTimer);
+            dirtyCheckTimer = setTimeout(updateDirtyUI, 80);
+        }
+
+        async function reloadSettingsFromDisk() {
+            settings = await ipcRenderer.invoke('settings:get') || {};
+            populateAll(settings);
+            await loadCalendars();
+            resetSnapshot();
+        }
+
+        async function saveAllDirty() {
+            const sections = getDirtySections();
+            for (const section of sections) {
+                await saveSection(section, { quiet: true });
+            }
+            setStatus(sections.length ? 'All changes saved' : 'Ready', sections.length ? 'ok' : '');
+        }
+
+        window.isDirty = isDirty;
+        window.saveAllDirty = saveAllDirty;
+        window.reloadSettingsFromDisk = reloadSettingsFromDisk;
+
+        function gatherGoogleAccounts() {
+            const accounts = {};
+            document.querySelectorAll('.google-account-card').forEach((card) => {
+                const id = card.dataset.accountId;
+                accounts[id] = {
+                    label: card.querySelector('.ga-label').value.trim() || id,
+                    credentialsFile: card.querySelector('.ga-credfile').value.trim()
+                        || (id === 'primary' ? 'credentials.json' : `credentials-${id}.json`),
+                    email: card.querySelector('.ga-email').value.trim(),
+                    enabled: card.querySelector('.ga-enabled').checked,
+                };
+            });
+            return accounts;
+        }
+
         function renderGoogleAccounts(accounts) {
-            const el = document.getElementById('google-accounts');
+            const el = document.getElementById('google-accounts-list');
             el.innerHTML = '';
             if (!accounts) return;
-            for (const [name, info] of Object.entries(accounts)) {
-                const span = document.createElement('span');
-                span.className = 'badge ' + (info.connected ? 'ok' : 'no');
-                span.textContent = `${name}: ${info.connected ? 'connected' : 'not connected'}`;
-                el.appendChild(span);
+            for (const [id, info] of Object.entries(accounts)) {
+                const card = document.createElement('div');
+                card.className = 'google-account-card';
+                card.dataset.accountId = id;
+                const badgeClass = info.connected ? 'ok' : 'no';
+                const badgeText = info.connected ? 'connected' : 'not connected';
+                card.innerHTML = `
+                    <h3>
+                        <span>${escapeHtml(info.label || id)}</span>
+                        <span class="badge ${badgeClass}">${badgeText}</span>
+                    </h3>
+                    <label class="field"><span>Label</span>
+                        <input type="text" class="ga-label" value="${escapeAttr(info.label || id)}" />
+                    </label>
+                    <label class="field"><span>Credentials file</span>
+                        <input type="text" class="ga-credfile" value="${escapeAttr(info.credentialsFile || info.file || '')}" placeholder="credentials-${escapeAttr(id)}.json" />
+                    </label>
+                    <label class="field"><span>Email (hint)</span>
+                        <input type="text" class="ga-email" value="${escapeAttr(info.email || '')}" placeholder="you@example.com" />
+                    </label>
+                    <label class="inline"><input type="checkbox" class="ga-enabled"${info.enabled !== false ? ' checked' : ''} /> Enabled</label>
+                    <div class="ga-actions">
+                        <button type="button" class="secondary small ga-connect">Connect</button>
+                        <button type="button" class="danger small ga-disconnect"${info.connected ? '' : ' disabled'}>Disconnect</button>
+                    </div>`;
+                card.querySelector('.ga-connect').onclick = async () => {
+                    setStatus(`Saving and connecting ${id}…`, 'busy');
+                    try {
+                        await ipcRenderer.invoke('settings:save', { section: 'google', patch: gatherGoogle() });
+                        await ipcRenderer.invoke('settings:action', { action: 'google-connect', params: { accountId: id } });
+                        setStatus(`OAuth started for ${info.label || id}`, 'ok');
+                    } catch (e) {
+                        setStatus(e.message || String(e), 'err');
+                    }
+                };
+                card.querySelector('.ga-disconnect').onclick = async () => {
+                    if (!confirm(`Disconnect ${info.label || id}? This removes ${info.credentialsFile || info.file}.`)) return;
+                    setStatus(`Disconnecting ${id}…`, 'busy');
+                    try {
+                        const res = await ipcRenderer.invoke('settings:action', { action: 'google-disconnect', params: { accountId: id } });
+                        if (!res?.ok) throw new Error(res?.error || 'Disconnect failed');
+                        const data = await ipcRenderer.invoke('settings:get');
+                        populateAll(data);
+                        calendarOptions = await ipcRenderer.invoke('settings:list-calendars') || [];
+                        renderCalendarCheckboxes(settings.google?.calendarIds);
+                        resetSnapshot();
+                        setStatus(`Disconnected ${info.label || id}`, 'ok');
+                    } catch (e) {
+                        setStatus(e.message || String(e), 'err');
+                    }
+                };
+                el.appendChild(card);
             }
+            scheduleDirtyCheck();
         }
 
         function renderCalendarCheckboxes(selectedIds) {
@@ -383,7 +667,8 @@
                 const summary = typeof cal === 'string' ? cal : (cal.summary || cal.name || id);
                 const label = document.createElement('label');
                 const checked = selected.has(id) ? ' checked' : '';
-                label.innerHTML = `<input type="checkbox" class="cal-cb" value="${escapeAttr(id)}"${checked} /> ${escapeHtml(summary)} <span class="sub">${escapeHtml(id)}</span>`;
+                const acct = cal.accountLabel ? `[${cal.accountLabel}] ` : '';
+                label.innerHTML = `<input type="checkbox" class="cal-cb" value="${escapeAttr(id)}"${checked} /> ${escapeHtml(acct + summary)} <span class="sub">${escapeHtml(id)}</span>`;
                 container.appendChild(label);
             });
         }
@@ -396,9 +681,13 @@
             const calendarIds = [...document.querySelectorAll('#google-calendars .cal-cb:checked')].map((el) => el.value);
             return {
                 clientId: document.getElementById('google-clientId').value.trim(),
-                clientSecret: document.getElementById('google-clientSecret').value,
+                clientSecret: effectiveSecret(
+                    document.getElementById('google-clientSecret').value,
+                    settings.google?.clientSecret,
+                ),
                 redirectUri: document.getElementById('google-redirectUri').value.trim(),
                 calendarIds,
+                accounts: gatherGoogleAccounts(),
                 pollIntervalSeconds: Number(document.getElementById('google-pollInterval').value) || 60,
                 pushEnabled: document.getElementById('google-pushEnabled').checked,
                 pushWebhookUrl: document.getElementById('google-pushWebhookUrl').value.trim(),
@@ -408,7 +697,10 @@
         function gatherHomeassistant() {
             return {
                 url: document.getElementById('ha-url').value.trim(),
-                token: document.getElementById('ha-token').value,
+                token: effectiveSecret(
+                    document.getElementById('ha-token').value,
+                    settings.homeassistant?.token,
+                ),
                 notifyTarget: document.getElementById('ha-notifyTarget').value.trim(),
                 dismissEntity: document.getElementById('ha-dismissEntity').value.trim(),
                 awayThresholdSeconds: document.getElementById('ha-awayThreshold').value.trim(),
@@ -417,15 +709,21 @@
         }
 
         function gatherClickup() {
+            const cur = settings.clickup?.rules || {};
+            const crr = cur.rules || {};
             return {
                 env: document.getElementById('clickup-env').value,
-                apiToken: document.getElementById('clickup-token').value,
+                apiToken: effectiveSecret(
+                    document.getElementById('clickup-token').value,
+                    settings.clickup?.apiToken,
+                ),
                 workspaceId: document.getElementById('clickup-workspaceId').value.trim(),
                 rules: {
                     enabled: document.getElementById('clickup-enabled').checked,
                     environment: document.getElementById('clickup-env').value,
                     pollIntervalSeconds: Number(document.getElementById('clickup-pollInterval').value) || 30,
-                    watchPeople: parseCommaList(document.getElementById('clickup-watchPeople').value),
+                    watchPeople: clickupPeoplePicker?.getSelectedIds() || [],
+                    watchTaskIds: clickupTasksPicker?.getSelectedIds() || [],
                     webhookUrl: document.getElementById('clickup-webhookUrl').value.trim(),
                     rules: {
                         dmFromPeople: document.getElementById('clickup-dmFromPeople').checked,
@@ -433,21 +731,103 @@
                         mentionMyGroups: document.getElementById('clickup-mentionMyGroups').checked,
                         taskCommentMention: document.getElementById('clickup-taskCommentMention').checked,
                         taskAssignedToMe: document.getElementById('clickup-taskAssignedToMe').checked,
-                        taskTagMatch: parseCommaList(document.getElementById('clickup-taskTagMatch').value),
+                        taskTagMatch: crr.taskTagMatch || [],
                     },
                 },
             };
         }
 
+        function clickupCredentials() {
+            return {
+                env: document.getElementById('clickup-env').value,
+                apiToken: effectiveSecret(
+                    document.getElementById('clickup-token').value,
+                    settings.clickup?.apiToken,
+                ),
+                workspaceId: document.getElementById('clickup-workspaceId').value.trim(),
+            };
+        }
+
+        async function browseClickUp(kind, { search, page }) {
+            const res = await ipcRenderer.invoke('settings:clickup-browse', {
+                kind,
+                search,
+                page,
+                credentials: clickupCredentials(),
+            });
+            if (!res?.ok) throw new Error(res?.error || 'Browse failed');
+            return { items: res.items || [], hasMore: Boolean(res.hasMore) };
+        }
+
+        function initClickupPickers(cur) {
+            const peopleIds = cur.watchPeople || [];
+            const taskIds = cur.watchTaskIds || [];
+            const peopleSelected = peopleIds.map((id) => ({ id: String(id), label: `User ${id}`, sublabel: id }));
+            const taskSelected = taskIds.map((id) => ({ id: String(id), label: `Task ${id}`, sublabel: id }));
+
+            if (!clickupPeoplePicker) {
+                clickupPeoplePicker = new WatchListPicker(document.getElementById('clickup-people-picker'), {
+                    placeholder: 'Search people by name or email…',
+                    emptyText: 'No people match — try a different search',
+                    watchingEmpty: 'Nobody on the watch list yet — search below to add.',
+                    selected: peopleSelected,
+                    loadItems: ({ search }) => browseClickUp('members', { search }),
+                    onChange: () => scheduleDirtyCheck(),
+                });
+            } else {
+                clickupPeoplePicker.setSelected(peopleSelected);
+            }
+
+            if (!clickupTasksPicker) {
+                clickupTasksPicker = new WatchListPicker(document.getElementById('clickup-tasks-picker'), {
+                    placeholder: 'Search tasks by name…',
+                    emptyText: 'No tasks match — try a different search or scroll for more',
+                    watchingEmpty: 'No tasks on the watch list — search below to add (empty list = all tasks).',
+                    selected: taskSelected,
+                    loadItems: ({ search, page }) => browseClickUp('tasks', { search, page }),
+                    onChange: () => scheduleDirtyCheck(),
+                });
+            } else {
+                clickupTasksPicker.setSelected(taskSelected);
+            }
+        }
+
+        async function enrichClickupPickerLabels() {
+            if (!clickupPeoplePicker && !clickupTasksPicker) return;
+            try {
+                const peopleRes = await browseClickUp('members', { search: '' });
+                const peopleById = new Map((peopleRes.items || []).map((i) => [String(i.id), i]));
+                if (clickupPeoplePicker) {
+                    const enriched = clickupPeoplePicker.getSelected().map((i) => peopleById.get(String(i.id)) || i);
+                    clickupPeoplePicker.setSelected(enriched);
+                }
+                const taskRes = await browseClickUp('tasks', { search: '', page: 0 });
+                const taskById = new Map((taskRes.items || []).map((i) => [String(i.id), i]));
+                if (clickupTasksPicker) {
+                    const enriched = clickupTasksPicker.getSelected().map((i) => taskById.get(String(i.id)) || i);
+                    clickupTasksPicker.setSelected(enriched);
+                }
+            } catch {
+                // token may not be configured yet
+            }
+        }
+
         function gatherEmail() {
+            const ema = settings.email?.rules?.accounts || settings.email?.accounts || {};
             return {
                 accounts: {
                     personal: {
-                        claudeApiKey: document.getElementById('email-claudeKey-personal').value,
+                        claudeApiKey: effectiveSecret(
+                            document.getElementById('email-claudeKey-personal').value,
+                            ema.personal?.claudeApiKey,
+                        ),
                         claudeModel: document.getElementById('email-claudeModel-personal').value.trim() || 'claude-haiku-4-5',
                     },
                     work: {
-                        claudeApiKey: document.getElementById('email-claudeKey-work').value,
+                        claudeApiKey: effectiveSecret(
+                            document.getElementById('email-claudeKey-work').value,
+                            ema.work?.claudeApiKey,
+                        ),
                         claudeModel: document.getElementById('email-claudeModel-work').value.trim() || 'claude-haiku-4-5',
                     },
                 },
@@ -462,7 +842,10 @@
 
         function gatherDatadog() {
             return {
-                apiKey: document.getElementById('datadog-apiKey').value,
+                apiKey: effectiveSecret(
+                    document.getElementById('datadog-apiKey').value,
+                    settings.datadog?.apiKey,
+                ),
                 site: document.getElementById('datadog-site').value.trim(),
                 rules: { enabled: document.getElementById('datadog-enabled').checked },
             };
@@ -489,12 +872,56 @@
             };
         }
 
+        function gatherUi() {
+            return {
+                menuBarTitle: document.getElementById('ui-menuBarTitle').checked,
+                trayIconStyle: document.getElementById('ui-trayIconStyle').value,
+                showFloatingHud: document.getElementById('ui-showFloatingHud').checked,
+                pushEnabled: document.getElementById('ui-pushEnabled').checked,
+                launchAtLogin: document.getElementById('ui-launchAtLogin').checked,
+            };
+        }
+
         function gatherGeneral() {
             return {
                 timezone: document.getElementById('general-timezone').value.trim(),
                 audioOutput: document.getElementById('general-audioOutput').value.trim(),
                 audioInput: document.getElementById('general-audioInput').value.trim(),
             };
+        }
+
+        function gatherTunnel() {
+            const hostname = document.getElementById('tunnel-hostname').value.trim();
+            const localPort = Number(document.getElementById('tunnel-port').value) || 3921;
+            const autoUpdateWebhookUrls = document.getElementById('tunnel-auto-urls').checked;
+            return {
+                token: effectiveSecret(
+                    document.getElementById('tunnel-token').value,
+                    settings.tunnel?.token,
+                ),
+                hostname,
+                localPort,
+                autoUpdateWebhookUrls,
+                rules: {
+                    enabled: document.getElementById('tunnel-enabled').checked,
+                    hostname,
+                    localPort,
+                    autoUpdateWebhookUrls,
+                },
+            };
+        }
+
+        function updateTunnelPreview() {
+            const host = document.getElementById('tunnel-hostname').value.trim();
+            const preview = document.getElementById('tunnel-url-preview');
+            if (!host) {
+                preview.textContent = '';
+                return;
+            }
+            const base = host.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+            preview.innerHTML =
+                `Google: <code>https://${escapeHtml(base)}/orbit/webhook/google-calendar</code><br>` +
+                `ClickUp: <code>https://${escapeHtml(base)}/orbit/webhook/clickup</code>`;
         }
 
         const gatherers = {
@@ -505,10 +932,13 @@
             email: gatherEmail,
             datadog: gatherDatadog,
             alerts: gatherAlerts,
+            tunnel: gatherTunnel,
             general: gatherGeneral,
+            ui: gatherUi,
         };
 
         function populateAll(data) {
+            isPopulating = true;
             settings = data || {};
 
             renderLights(settings.lights?.hosts || []);
@@ -534,11 +964,13 @@
             const crr = cur.rules || {};
             document.getElementById('clickup-enabled').checked = Boolean(cur.enabled);
             document.getElementById('clickup-env').value = cu.env || cur.environment || 'staging';
-            document.getElementById('clickup-token').value = cu.apiToken || '';
+            const clickupTokenEl = document.getElementById('clickup-token');
+            clickupTokenEl.value = cu.apiToken || '';
+            clickupTokenEl.placeholder = cu.apiToken ? 'Saved (leave blank to keep)' : '';
             document.getElementById('clickup-workspaceId').value = cu.workspaceId || cur.workspaceId || '';
             document.getElementById('clickup-pollInterval').value = cur.pollIntervalSeconds ?? 30;
-            document.getElementById('clickup-watchPeople').value = (cur.watchPeople || []).join(', ');
-            document.getElementById('clickup-taskTagMatch').value = (crr.taskTagMatch || []).join(', ');
+            initClickupPickers(cur);
+            enrichClickupPickerLabels().catch(() => {});
             document.getElementById('clickup-webhookUrl').value = cur.webhookUrl || '';
             const whStatus = document.getElementById('clickup-webhook-status');
             if (cur.webhookId) {
@@ -583,44 +1015,160 @@
                 });
             });
 
+            const tn = settings.tunnel || {};
+            const tnr = tn.rules || {};
+            document.getElementById('tunnel-enabled').checked = Boolean(tnr.enabled);
+            const tunnelTokenEl = document.getElementById('tunnel-token');
+            tunnelTokenEl.value = tn.token || '';
+            tunnelTokenEl.placeholder = tn.token ? 'Saved (leave blank to keep)' : 'From Cloudflare Zero Trust → Tunnels';
+            document.getElementById('tunnel-hostname').value = tn.hostname || tnr.hostname || '';
+            document.getElementById('tunnel-port').value = tn.localPort ?? tnr.localPort ?? 3921;
+            document.getElementById('tunnel-auto-urls').checked = tn.autoUpdateWebhookUrls !== false;
+            const rt = tn.runtime || {};
+            const ph = rt.publicHealth || {};
+            const rtEl = document.getElementById('tunnel-runtime-status');
+            let statusText = '';
+            if (rt.running) {
+                statusText = `Status: running${rt.binary ? ` (${rt.binary})` : ''}`;
+                rtEl.className = 'help ok';
+            } else if (rt.lastError) {
+                statusText = `Status: error — ${rt.lastError}`;
+                rtEl.className = 'help err';
+            } else {
+                statusText = `Status: ${rt.status || 'stopped'}`;
+                rtEl.className = 'help';
+            }
+            if (ph.checking) {
+                statusText += ' · Checking public health…';
+            } else if (ph.ok === true) {
+                statusText += ' · Public health OK';
+                if (!rt.running) rtEl.className = 'help ok';
+            } else if (ph.ok === false) {
+                statusText += ` · Public health failed — ${ph.error || 'unreachable'}`;
+                rtEl.className = 'help err';
+            }
+            rtEl.textContent = statusText;
+            updateTunnelPreview();
+
+            const ui = settings.ui || {};
+            document.getElementById('ui-menuBarTitle').checked = Boolean(ui.menuBarTitle);
+            document.getElementById('ui-trayIconStyle').value = ui.trayIconStyle || 'text';
+            document.getElementById('ui-showFloatingHud').checked = ui.showFloatingHud !== false;
+            const pushEl = document.getElementById('ui-pushEnabled');
+            pushEl.checked = Boolean(ui.pushEnabled);
+            pushEl.disabled = ui.pushAvailable === false;
+            document.getElementById('ui-push-help').style.display = ui.pushAvailable === false ? '' : 'none';
+            document.getElementById('ui-launchAtLogin').checked = Boolean(ui.launchAtLogin);
             document.getElementById('general-timezone').value = settings.general?.timezone || '';
             document.getElementById('general-audioOutput').value = settings.general?.audioOutput || '';
             document.getElementById('general-audioInput').value = settings.general?.audioInput || '';
+
+            isPopulating = false;
         }
 
-        async function saveSection(section) {
+        async function saveSection(section, { quiet = false } = {}) {
             const gather = gatherers[section];
             if (!gather) return;
-            setStatus('Saving…', 'busy');
+            if (!quiet) setStatus('Saving…', 'busy');
             try {
                 const patch = gather();
                 const result = await ipcRenderer.invoke('settings:save', { section, patch });
-                settings[section] = { ...(settings[section] || {}), ...patch };
-                if (section === 'google' && patch.calendarIds) {
-                    settings.google = { ...settings.google, calendarIds: patch.calendarIds };
-                }
-                setStatus(result?.message || 'Saved', 'ok');
+                if (!result?.ok) throw new Error(result?.error || 'Save failed');
+                settings = await ipcRenderer.invoke('settings:get') || {};
+                populateAll(settings);
+                if (section === 'google') await loadCalendars();
+                resetSnapshot();
+                if (!quiet) setStatus('Saved', 'ok');
             } catch (e) {
-                setStatus(e.message || String(e), 'err');
+                if (!quiet) setStatus(e.message || String(e), 'err');
+                throw e;
             }
         }
 
         document.querySelectorAll('[data-save]').forEach((btn) => {
-            btn.addEventListener('click', () => saveSection(btn.dataset.save));
+            btn.addEventListener('click', () => saveSection(btn.dataset.save).catch(() => {}));
         });
+
+        document.querySelector('[data-save="general-ui"]')?.addEventListener('click', async () => {
+            setStatus('Saving…', 'busy');
+            try {
+                await saveSection('ui', { quiet: true });
+                await saveSection('general', { quiet: true });
+                settings = await ipcRenderer.invoke('settings:get') || {};
+                populateAll(settings);
+                resetSnapshot();
+                setStatus('Saved', 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        });
+
+        document.querySelector('main').addEventListener('input', scheduleDirtyCheck);
+        document.querySelector('main').addEventListener('change', scheduleDirtyCheck);
 
         document.getElementById('lights-add').onclick = () => {
             const list = document.getElementById('lights-list');
-            const hosts = [...list.querySelectorAll('.light-ip')].map((el) => el.value);
+            const hosts = [...list.querySelectorAll('.light-ip')].map((el) => el.value.trim()).filter(Boolean);
             hosts.push('');
             renderLights(hosts);
         };
 
-        document.getElementById('google-connect').onclick = async () => {
-            setStatus('Opening Google OAuth…', 'busy');
+        document.getElementById('lights-detect').onclick = async () => {
+            setStatus('Scanning for Elgato lights…', 'busy');
             try {
-                await ipcRenderer.invoke('settings:action', { action: 'google-connect', params: {} });
-                setStatus('Google connect flow started', 'ok');
+                const res = await ipcRenderer.invoke('settings:test', { kind: 'lights-discover', params: {} });
+                if (!res?.ok) throw new Error(res?.error || 'Discovery failed');
+                const discovered = res.lights || [];
+                if (!discovered.length) {
+                    setStatus('No Elgato lights found on the network', 'err');
+                    return;
+                }
+                const existing = new Set(
+                    [...document.querySelectorAll('#lights-list .light-ip')]
+                        .map((el) => el.value.trim())
+                        .filter(Boolean),
+                );
+                for (const light of discovered) {
+                    if (light.host) existing.add(light.host);
+                }
+                renderLights([...existing]);
+                const names = discovered.map((l) => l.name || l.host).join(', ');
+                setStatus(`Found ${discovered.length} light(s): ${names}`, 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        };
+
+        document.getElementById('tunnel-hostname').addEventListener('input', () => {
+            updateTunnelPreview();
+            scheduleDirtyCheck();
+        });
+
+        document.getElementById('tunnel-test').onclick = async () => {
+            setStatus('Testing tunnel health…', 'busy');
+            try {
+                await ipcRenderer.invoke('settings:save', { section: 'tunnel', patch: gatherTunnel() });
+                const res = await ipcRenderer.invoke('settings:test', {
+                    kind: 'tunnel-health',
+                    params: { hostname: document.getElementById('tunnel-hostname').value.trim() },
+                });
+                if (!res?.ok) throw new Error(res?.error || 'Health check failed');
+                setStatus(`Tunnel OK: ${res.url}`, 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        };
+
+        document.getElementById('tunnel-restart').onclick = async () => {
+            setStatus('Restarting tunnel…', 'busy');
+            try {
+                await ipcRenderer.invoke('settings:save', { section: 'tunnel', patch: gatherTunnel() });
+                const res = await ipcRenderer.invoke('settings:action', { action: 'tunnel-restart', params: {} });
+                if (!res?.ok) throw new Error(res?.error || 'Restart failed');
+                const data = await ipcRenderer.invoke('settings:get');
+                populateAll(data);
+                resetSnapshot();
+                setStatus('Tunnel restarted', 'ok');
             } catch (e) {
                 setStatus(e.message || String(e), 'err');
             }
@@ -662,6 +1210,7 @@
                 setStatus(`Webhooks registered (${i.environment}): ${(i.events || []).join(', ')}`, 'ok');
                 const data = await ipcRenderer.invoke('settings:get');
                 populateAll(data);
+                resetSnapshot();
             } catch (e) {
                 setStatus(e.message || String(e), 'err');
             }
@@ -722,11 +1271,44 @@
                 settings = await ipcRenderer.invoke('settings:get') || {};
                 populateAll(settings);
                 await loadCalendars();
+                resetSnapshot();
                 setStatus('Ready', '');
             } catch (e) {
                 setStatus(e.message || String(e), 'err');
             }
         }
+
+        ipcRenderer.on('settings:refresh', async () => {
+            try {
+                settings = await ipcRenderer.invoke('settings:get') || {};
+                populateAll(settings);
+                await loadCalendars();
+                resetSnapshot();
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        });
+
+        ipcRenderer.on('settings:request-close', async () => {
+            if (!isDirty()) {
+                ipcRenderer.send('settings:close-allowed');
+                return;
+            }
+            const sections = getDirtySections().map((s) => SECTION_LABELS[s] || s).join(', ');
+            const choice = await ipcRenderer.invoke('settings:confirm-close', { sections });
+            if (choice === 'cancel') return;
+            if (choice === 'save') {
+                try {
+                    await saveAllDirty();
+                } catch {
+                    return;
+                }
+            }
+            if (choice === 'discard') {
+                await reloadSettingsFromDisk();
+            }
+            ipcRenderer.send('settings:close-allowed');
+        });
 
         init();
     </script>

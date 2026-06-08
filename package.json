@@ -46,12 +46,17 @@
       "package.json",
       "config-store.js",
       "assets/settings.html",
+      "assets/virtual-picker.js",
+      "assets/google-setup.html",
       "*-rules.example.json",
       "alert-hub.js",
       "clickup.js",
       "clickup-config.js",
       "calendar-watch.js",
-      "webhook-server.js"
+      "webhook-server.js",
+      "elgato-discover.js",
+      "cloudflare-tunnel.js",
+      "orbit-log.js"
     ],
     "asarUnpack": [
       "sounds/**/*",
