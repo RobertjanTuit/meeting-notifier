@@ -96,14 +96,19 @@ class AlertHub extends EventEmitter {
         return { delivered: true };
     }
 
-    async deliverMeeting({ kind, meeting, title, message, urgent }) {
+    async deliverMeeting({ kind, meeting, title, message, urgent, quick = false }) {
         if (this.inQuietHours()) {
             console.log(`🔕 Meeting alert skipped (quiet hours): ${title}`);
             return { delivered: false, reason: 'quiet-hours' };
         }
 
         const cfg = this.getSourceDelivery('meetings');
-        const pulseByKind = {
+        const pulseByKind = quick ? {
+            '5min': [1, 500],
+            '1min': [1, 500],
+            start: [2, 600],
+            nag: [1, 500],
+        } : {
             '5min': [1, 2000],
             '1min': [2, 1500],
             start: [5, 1000],
