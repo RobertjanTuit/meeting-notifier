@@ -1,5 +1,25 @@
 {
   "pollIntervalSeconds": 60,
   "pushEnabled": false,
-  "pushWebhookUrl": "https://your-tunnel.example.com/orbit/webhook/google-calendar"
+  "pushWebhookUrl": "https://your-tunnel.example.com/orbit/webhook/google-calendar",
+  "accounts": {
+    "primary": {
+      "label": "Primary",
+      "enabled": true,
+      "credentialsFile": "credentials.json",
+      "email": ""
+    },
+    "personal": {
+      "label": "Personal",
+      "enabled": true,
+      "credentialsFile": "credentials-personal.json",
+      "email": "you@gmail.com"
+    },
+    "work": {
+      "label": "Work",
+      "enabled": true,
+      "credentialsFile": "credentials-work.json",
+      "email": "you@company.com"
+    }
+  }
 }

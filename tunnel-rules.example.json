@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "hostname": "orbit.example.com",
+  "localPort": 3921,
+  "autoUpdateWebhookUrls": true
+}

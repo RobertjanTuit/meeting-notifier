@@ -6,6 +6,7 @@
   "pollIntervalSeconds": 30,
   "watchChannelIds": [],
   "watchPeople": [],
+  "watchTaskIds": [],
   "webhookUrl": "",
   "webhookId": null,
   "webhookSecret": "",

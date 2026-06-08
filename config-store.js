@@ -10,12 +10,42 @@ const RULE_FILES = {
     email: 'email-rules.json',
     datadog: 'datadog-rules.json',
     alerts: 'alert-rules.json',
+    tunnel: 'tunnel-rules.json',
+};
+
+const DEFAULT_TUNNEL_RULES = {
+    enabled: false,
+    hostname: '',
+    localPort: 3921,
+    autoUpdateWebhookUrls: true,
+};
+
+const DEFAULT_GOOGLE_ACCOUNTS = {
+    primary: {
+        label: 'Primary',
+        enabled: true,
+        credentialsFile: 'credentials.json',
+        email: '',
+    },
+    personal: {
+        label: 'Personal',
+        enabled: true,
+        credentialsFile: 'credentials-personal.json',
+        email: '',
+    },
+    work: {
+        label: 'Work',
+        enabled: true,
+        credentialsFile: 'credentials-work.json',
+        email: '',
+    },
 };
 
 const DEFAULT_GOOGLE_RULES = {
     pollIntervalSeconds: 60,
     pushEnabled: false,
     pushWebhookUrl: '',
+    accounts: DEFAULT_GOOGLE_ACCOUNTS,
 };
 
 const DEFAULT_RULES = {
@@ -27,6 +57,7 @@ const DEFAULT_RULES = {
         pollIntervalSeconds: 30,
         watchChannelIds: [],
         watchPeople: [],
+        watchTaskIds: [],
         webhookUrl: '',
         webhookId: null,
         webhookSecret: '',
@@ -99,6 +130,52 @@ function readEnvObject(envPath) {
     return result;
 }
 
+/** Env keys merged from alternate .env files or process.env when missing in the active config. */
+const PROCESS_ENV_FALLBACK_KEYS = [
+    'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI',
+    'ELGATO_KEY_LIGHTS', 'CALENDAR_ID', 'TIMEZONE',
+    'HA_URL', 'HA_TOKEN', 'HA_NOTIFY_TARGET', 'PUSH_AWAY_THRESHOLD_SECONDS',
+    'PUSH_URGENT_MODE', 'HA_DISMISS_ENTITY',
+    'CLICKUP_ENV', 'CLICKUP_API_TOKEN', 'CLICKUP_WORKSPACE_ID', 'CLICKUP_API_BASE_URL',
+    'DD_API_KEY', 'DD_APP_KEY', 'DD_SITE',
+    'CLOUDFLARE_TUNNEL_TOKEN',
+];
+
+function mergeMissingEnvKeys(destEnvPath, ...sourceEnvPaths) {
+    if (!fs.existsSync(destEnvPath)) return 0;
+    const dest = readEnvObject(destEnvPath);
+    const updates = {};
+    for (const srcPath of sourceEnvPaths) {
+        if (!srcPath || !fs.existsSync(srcPath)) continue;
+        const src = readEnvObject(srcPath);
+        for (const [key, value] of Object.entries(src)) {
+            if (String(value || '').trim() && !String(dest[key] || '').trim()) {
+                updates[key] = value;
+                dest[key] = value;
+            }
+        }
+    }
+    if (Object.keys(updates).length) {
+        writeEnvUpdates(destEnvPath, updates);
+        console.log(`📂 Merged ${Object.keys(updates).length} env key(s) into ${path.basename(destEnvPath)}`);
+    }
+    return Object.keys(updates).length;
+}
+
+function applyProcessEnvFallbacks(fromFile) {
+    const merged = { ...fromFile };
+    for (const key of PROCESS_ENV_FALLBACK_KEYS) {
+        if (!String(merged[key] || '').trim() && process.env[key]) {
+            merged[key] = process.env[key];
+        }
+    }
+    return merged;
+}
+
+function setEnvIfNonempty(updates, key, value) {
+    if (value != null && String(value).trim() !== '') updates[key] = value;
+}
+
 function writeEnvUpdates(envPath, updates) {
     const dir = path.dirname(envPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -140,16 +217,32 @@ function readCalendars(configDir) {
 }
 
 function googleAccountStatus(configDir) {
-    return {
-        primary: { connected: fs.existsSync(path.join(configDir, 'credentials.json')), file: 'credentials.json' },
-        personal: { connected: fs.existsSync(path.join(configDir, 'credentials-personal.json')), file: 'credentials-personal.json' },
-        work: { connected: fs.existsSync(path.join(configDir, 'credentials-work.json')), file: 'credentials-work.json' },
-    };
+    const rules = readJsonFile(path.join(configDir, RULE_FILES.google), DEFAULT_GOOGLE_RULES);
+    const accounts = { ...DEFAULT_GOOGLE_ACCOUNTS, ...(rules.accounts || {}) };
+    const result = {};
+    for (const [id, acct] of Object.entries(accounts)) {
+        const credentialsFile = acct.credentialsFile || `credentials-${id}.json`;
+        result[id] = {
+            ...acct,
+            id,
+            credentialsFile,
+            connected: fs.existsSync(path.join(configDir, credentialsFile)),
+            file: credentialsFile,
+        };
+    }
+    return result;
 }
 
-function createConfigStore(configDir) {
+function createConfigStore(configDir, { extraEnvSources = [] } = {}) {
     const envPath = path.join(configDir, '.env');
-    const env = () => readEnvObject(envPath);
+
+    function syncEnvFromSources() {
+        if (extraEnvSources.length) mergeMissingEnvKeys(envPath, ...extraEnvSources);
+        reloadIntoProcess();
+    }
+
+    syncEnvFromSources();
+    const env = () => applyProcessEnvFallbacks(readEnvObject(envPath));
     const rulesPath = (name) => path.join(configDir, RULE_FILES[name]);
 
     function getSection(section) {
@@ -204,6 +297,16 @@ function createConfigStore(configDir) {
             }
             case 'alerts':
                 return readJsonFile(rulesPath('alerts'), DEFAULT_RULES.alerts);
+            case 'tunnel': {
+                const rules = readJsonFile(rulesPath('tunnel'), DEFAULT_TUNNEL_RULES);
+                return {
+                    token: e.CLOUDFLARE_TUNNEL_TOKEN || '',
+                    hostname: rules.hostname || '',
+                    localPort: rules.localPort ?? 3921,
+                    autoUpdateWebhookUrls: rules.autoUpdateWebhookUrls !== false,
+                    rules,
+                };
+            }
             case 'general':
                 return {
                     timezone: e.TIMEZONE || 'America/Los_Angeles',
@@ -228,13 +331,16 @@ function createConfigStore(configDir) {
             email: getSection('email'),
             datadog: getSection('datadog'),
             alerts: getSection('alerts'),
+            tunnel: getSection('tunnel'),
             general: getSection('general'),
         };
     }
 
     function saveSection(section, patch) {
         const envUpdates = {};
-        const restart = { calendar: false, lights: false, clickup: false, email: false, datadog: false };
+        const restart = {
+            calendar: false, lights: false, clickup: false, email: false, datadog: false, tunnel: false,
+        };
         switch (section) {
             case 'lights':
                 envUpdates.ELGATO_KEY_LIGHTS = (patch.hosts || []).map((h) => h.trim()).filter(Boolean).join(',');
@@ -242,7 +348,7 @@ function createConfigStore(configDir) {
                 break;
             case 'google':
                 if (patch.clientId != null) envUpdates.GOOGLE_CLIENT_ID = patch.clientId;
-                if (patch.clientSecret != null) envUpdates.GOOGLE_CLIENT_SECRET = patch.clientSecret;
+                setEnvIfNonempty(envUpdates, 'GOOGLE_CLIENT_SECRET', patch.clientSecret);
                 if (patch.redirectUri != null) envUpdates.GOOGLE_REDIRECT_URI = patch.redirectUri;
                 if (patch.calendarIds != null) envUpdates.CALENDAR_ID = patch.calendarIds.join(',');
                 if (patch.calendars != null) writeJsonFile(path.join(configDir, 'calendars.json'), patch.calendars);
@@ -258,11 +364,23 @@ function createConfigStore(configDir) {
                         ...(patch.pushWebhookUrl != null ? { pushWebhookUrl: patch.pushWebhookUrl } : {}),
                     });
                 }
+                if (patch.accounts != null) {
+                    const cur = readJsonFile(rulesPath('google'), DEFAULT_GOOGLE_RULES);
+                    const merged = { ...DEFAULT_GOOGLE_ACCOUNTS, ...cur.accounts };
+                    for (const [id, acct] of Object.entries(patch.accounts)) {
+                        const file = acct.credentialsFile || merged[id]?.credentialsFile;
+                        if (file && /[/\\]/.test(file)) {
+                            throw new Error('Credentials file must be a simple filename in the config folder');
+                        }
+                        merged[id] = { ...(merged[id] || {}), ...acct };
+                    }
+                    writeJsonFile(rulesPath('google'), { ...cur, accounts: merged });
+                }
                 restart.calendar = true;
                 break;
             case 'homeassistant':
                 if (patch.url != null) envUpdates.HA_URL = patch.url;
-                if (patch.token != null) envUpdates.HA_TOKEN = patch.token;
+                setEnvIfNonempty(envUpdates, 'HA_TOKEN', patch.token);
                 if (patch.notifyTarget != null) envUpdates.HA_NOTIFY_TARGET = patch.notifyTarget;
                 if (patch.awayThresholdSeconds != null) envUpdates.PUSH_AWAY_THRESHOLD_SECONDS = String(patch.awayThresholdSeconds);
                 if (patch.urgentMode != null) envUpdates.PUSH_URGENT_MODE = patch.urgentMode;
@@ -270,7 +388,7 @@ function createConfigStore(configDir) {
                 break;
             case 'clickup':
                 if (patch.env != null) envUpdates.CLICKUP_ENV = patch.env;
-                if (patch.apiToken != null) envUpdates.CLICKUP_API_TOKEN = patch.apiToken;
+                setEnvIfNonempty(envUpdates, 'CLICKUP_API_TOKEN', patch.apiToken);
                 if (patch.workspaceId != null) envUpdates.CLICKUP_WORKSPACE_ID = String(patch.workspaceId);
                 if (patch.apiBaseUrl != null) envUpdates.CLICKUP_API_BASE_URL = patch.apiBaseUrl;
                 if (patch.rules != null) writeJsonFile(rulesPath('clickup'), { ...getSection('clickup').rules, ...patch.rules });
@@ -290,14 +408,35 @@ function createConfigStore(configDir) {
                 break;
             }
             case 'datadog':
-                if (patch.apiKey != null) envUpdates.DD_API_KEY = patch.apiKey;
-                if (patch.appKey != null) envUpdates.DD_APP_KEY = patch.appKey;
+                setEnvIfNonempty(envUpdates, 'DD_API_KEY', patch.apiKey);
+                setEnvIfNonempty(envUpdates, 'DD_APP_KEY', patch.appKey);
                 if (patch.site != null) envUpdates.DD_SITE = patch.site;
                 if (patch.rules != null) writeJsonFile(rulesPath('datadog'), { ...getSection('datadog').rules, ...patch.rules });
                 restart.datadog = true;
                 break;
             case 'alerts':
                 writeJsonFile(rulesPath('alerts'), patch);
+                break;
+            case 'tunnel':
+                setEnvIfNonempty(envUpdates, 'CLOUDFLARE_TUNNEL_TOKEN', patch.token);
+                if (patch.rules != null) {
+                    writeJsonFile(rulesPath('tunnel'), {
+                        ...readJsonFile(rulesPath('tunnel'), DEFAULT_TUNNEL_RULES),
+                        ...patch.rules,
+                    });
+                }
+                if (patch.hostname != null || patch.localPort != null || patch.autoUpdateWebhookUrls != null) {
+                    const cur = readJsonFile(rulesPath('tunnel'), DEFAULT_TUNNEL_RULES);
+                    writeJsonFile(rulesPath('tunnel'), {
+                        ...cur,
+                        ...(patch.hostname != null ? { hostname: patch.hostname } : {}),
+                        ...(patch.localPort != null ? { localPort: Number(patch.localPort) || 3921 } : {}),
+                        ...(patch.autoUpdateWebhookUrls != null
+                            ? { autoUpdateWebhookUrls: patch.autoUpdateWebhookUrls }
+                            : {}),
+                    });
+                }
+                restart.tunnel = true;
                 break;
             case 'general':
                 if (patch.timezone != null) envUpdates.TIMEZONE = patch.timezone;
@@ -329,7 +468,25 @@ function createConfigStore(configDir) {
         };
     }
 
-    return { configDir, envPath, getAll, getSection, saveSection, reloadIntoProcess, getClaudeConfig };
+    return {
+        configDir,
+        envPath,
+        getAll,
+        getSection,
+        saveSection,
+        reloadIntoProcess,
+        syncEnvFromSources,
+        getClaudeConfig,
+        mergeMissingEnvKeys,
+    };
 }
 
-module.exports = { createConfigStore, DEFAULT_RULES, DEFAULT_GOOGLE_RULES, RULE_FILES };
+module.exports = {
+    createConfigStore,
+    mergeMissingEnvKeys,
+    DEFAULT_RULES,
+    DEFAULT_GOOGLE_RULES,
+    DEFAULT_GOOGLE_ACCOUNTS,
+    DEFAULT_TUNNEL_RULES,
+    RULE_FILES,
+};
