@@ -3,6 +3,7 @@ const EventEmitter = require('events');
 const fs = require('fs');
 const path = require('path');
 const { resolveClickUpConfig } = require('./clickup-config.js');
+const log = require('./orbit-log.js');
 
 const WEBHOOK_EVENTS = ['taskCommentPosted', 'taskAssigneeUpdated', 'taskTagUpdated'];
 
@@ -106,18 +107,142 @@ class ClickUpWatcher extends EventEmitter {
 
     _rules() { return this.configStore.getSection('clickup'); }
 
-    _client() {
+    _client(overrides = {}) {
         const section = this._rules();
+        const rules = section.rules || {};
         const cfg = resolveClickUpConfig({
-            CLICKUP_ENV: section.env,
-            CLICKUP_API_TOKEN: section.apiToken,
-            CLICKUP_WORKSPACE_ID: section.workspaceId,
+            CLICKUP_ENV: overrides.env ?? section.env,
+            CLICKUP_API_TOKEN: overrides.apiToken ?? section.apiToken,
+            CLICKUP_WORKSPACE_ID: overrides.workspaceId ?? section.workspaceId,
             CLICKUP_API_BASE_URL: section.apiBaseUrl,
-            workspaceId: section.rules?.workspaceId,
+            workspaceId: overrides.workspaceId ?? rules.workspaceId,
         });
-        if (!cfg.token) throw new Error('CLICKUP_API_TOKEN not set');
-        if (!cfg.workspaceId) throw new Error('CLICKUP_WORKSPACE_ID not set');
+        if (!cfg.token) throw new Error('CLICKUP API token is not set — enter it above');
+        if (!cfg.workspaceId) throw new Error('CLICKUP workspace ID is not set');
         return { client: new ClickUpClient(cfg), cfg };
+    }
+
+    _memberItems(team) {
+        return (team?.members || []).map((m) => {
+            const user = m.user || m;
+            const id = String(user.id || m.userid || '');
+            if (!id) return null;
+            return {
+                id,
+                label: user.username || user.email || id,
+                sublabel: user.email || user.username || '',
+            };
+        }).filter(Boolean);
+    }
+
+    _memberLabel(userId) {
+        const id = String(userId);
+        const cached = this._membersCache?.items?.find((m) => String(m.id) === id);
+        return cached?.label || `User ${id}`;
+    }
+
+    getWatchedPeopleLabels() {
+        const rules = this._rules().rules || {};
+        return (rules.watchPeople || []).map((userId) => ({
+            id: String(userId),
+            label: this._memberLabel(userId),
+        }));
+    }
+
+    async warmMemberCache() {
+        await this.browseMembers({ search: '' });
+    }
+
+    /** Preview what a watched-person chat message alert looks like. */
+    async testWatchedPersonAlert(personId) {
+        if (!this.alertHub) throw new Error('Alert hub not initialized');
+
+        const rules = this._rules().rules;
+        if (!rules?.enabled) throw new Error('ClickUp is disabled in Settings');
+
+        const id = String(personId);
+        const watchIds = this._watchUserIds(rules);
+        if (!watchIds.has(id)) throw new Error(`User ${id} is not on the watch list`);
+
+        const { client, cfg } = this._client();
+        try {
+            await this.warmMemberCache();
+        } catch {
+            // names fall back to User {id}
+        }
+        const name = this._memberLabel(id);
+
+        let channelName = 'team-chat';
+        let channelId = '';
+        try {
+            const channelsRes = await client.getChannels(cfg.workspaceId);
+            const channels = channelsRes.data || channelsRes.channels || [];
+            if (channels[0]) {
+                channelName = channels[0].name || channelName;
+                channelId = String(channels[0].id || '');
+            }
+        } catch {
+            // use fallback channel label
+        }
+
+        const message = 'Hey — can you take a quick look when you get a chance?';
+        log.clickup(`Test alert — ${name} says something in #${channelName}`);
+
+        await this.alertHub.deliver({
+            source: 'clickup',
+            title: `ClickUp: ${channelName}`,
+            message,
+            urgent: false,
+            url: channelId
+                ? `https://app.clickup.com/${cfg.workspaceId}/chat/r/${channelId}`
+                : `https://app.clickup.com/${cfg.workspaceId}/chat`,
+            meta: { reason: 'dm-from-watched-person', test: true, fromUserId: id, fromName: name },
+        });
+        return { name, channelName };
+    }
+
+    async browseMembers({ search = '', env, apiToken, workspaceId } = {}) {
+        const { client, cfg } = this._client({ env, apiToken, workspaceId });
+        const cacheKey = String(cfg.workspaceId);
+        const now = Date.now();
+        if (!this._membersCache || this._membersCache.teamId !== cacheKey || now - this._membersCache.at > 5 * 60 * 1000) {
+            const teams = await client.getTeams();
+            const team = teams.teams?.find((t) => String(t.id) === cacheKey);
+            this._membersCache = {
+                at: now,
+                teamId: cacheKey,
+                items: this._memberItems(team),
+            };
+        }
+        let items = this._membersCache.items;
+        const q = search.trim().toLowerCase();
+        if (q) {
+            items = items.filter(
+                (i) => i.label.toLowerCase().includes(q)
+                    || String(i.sublabel || '').toLowerCase().includes(q)
+                    || String(i.id).includes(q),
+            );
+        }
+        return { items, hasMore: false };
+    }
+
+    async browseTasks({ search = '', page = 0, env, apiToken, workspaceId } = {}) {
+        const { client, cfg } = this._client({ env, apiToken, workspaceId });
+        const data = await client.request(
+            `/api/v2/team/${cfg.workspaceId}/task?page=${page}&include_closed=false&subtasks=true`,
+        );
+        let items = (data.tasks || []).map((t) => ({
+            id: String(t.id),
+            label: t.name || String(t.id),
+            sublabel: [t.status?.status, t.url ? '' : ''].filter(Boolean).join('') || (t.list?.name || ''),
+        }));
+        const q = search.trim().toLowerCase();
+        if (q) {
+            items = items.filter(
+                (i) => i.label.toLowerCase().includes(q) || String(i.id).includes(q),
+            );
+        }
+        return { items, hasMore: (data.tasks || []).length >= 100 };
     }
 
     async testConnection() {
@@ -144,8 +269,12 @@ class ClickUpWatcher extends EventEmitter {
     }
 
     stop() {
+        if (this._timer) {
+            clearInterval(this._timer);
+            this._timer = null;
+            log.clickup('Watcher stopped');
+        }
         this._running = false;
-        if (this._timer) { clearInterval(this._timer); this._timer = null; }
     }
 
     start() {
@@ -157,12 +286,12 @@ class ClickUpWatcher extends EventEmitter {
         this._running = true;
         const intervalMs = Math.max(10, Number(rules.pollIntervalSeconds) || 30) * 1000;
         const tick = () => this.poll().catch((err) => {
-            console.error('ClickUp poll error:', err.message);
+            log.clickupError(`Poll error: ${err.message}`);
             this.emit('error', err);
         });
         tick();
         this._timer = setInterval(tick, intervalMs);
-        console.log(`✓ ClickUp watcher (${section.env || 'staging'}, ${intervalMs / 1000}s poll)`);
+        log.clickup(`Watcher started (${section.env || 'staging'}, poll every ${intervalMs / 1000}s)`);
     }
 
     restart() { this.start(); }
@@ -231,6 +360,8 @@ class ClickUpWatcher extends EventEmitter {
                 const decision = await this._shouldAlert(msg, rules, client, myUserId);
                 if (!decision.notify) continue;
 
+                log.clickup(`Chat alert (${decision.reason}) in #${channel.name || channel.id}: ${this._snippet(msg.content)}`);
+
                 await this.alertHub.deliver({
                     source: 'clickup',
                     title: `ClickUp: ${channel.name || channel.id}`,
@@ -295,6 +426,10 @@ class ClickUpWatcher extends EventEmitter {
         const event = body.event;
         const taskId = body.task_id || body.task?.id;
         const taskName = body.task?.name || body.task_name || taskId || 'Task';
+        const watchTasks = new Set((rules.watchTaskIds || []).map((id) => String(id)).filter(Boolean));
+        if (watchTasks.size && taskId && !watchTasks.has(String(taskId))) {
+            return { notify: false, skipped: 'task-not-watched' };
+        }
 
         if (event === 'taskAssigneeUpdated' && r.taskAssignedToMe) {
             for (const item of this._historyItems(body)) {
@@ -360,6 +495,43 @@ class ClickUpWatcher extends EventEmitter {
         return { notify: false };
     }
 
+    _normalizeWebhookEndpoint(url) {
+        return String(url || '').trim().replace(/\/+$/, '');
+    }
+
+    async _adoptExistingWebhook(client, cfg, endpoint) {
+        const url = this._normalizeWebhookEndpoint(endpoint);
+        const list = await client.listWebhooks(cfg.workspaceId);
+        const match = (list.webhooks || []).find(
+            (wh) => this._normalizeWebhookEndpoint(wh.endpoint) === url,
+        );
+        if (!match?.id || !match?.secret) return null;
+
+        this.configStore.saveSection('clickup', {
+            rules: {
+                webhookUrl: url,
+                webhookId: match.id,
+                webhookSecret: match.secret,
+            },
+        });
+        this.configStore.reloadIntoProcess();
+
+        log.clickup(`Webhooks reconciled from ClickUp (${cfg.environment}) → ${url}`);
+        if (match.health?.status === 'failing') {
+            log.clickupWarn(
+                `ClickUp reports webhook delivery failing (${match.health.fail_count || 0} failures) — check tunnel health`,
+            );
+        }
+        return {
+            webhookId: match.id,
+            endpoint: url,
+            events: match.events,
+            environment: cfg.environment,
+            adopted: true,
+            health: match.health,
+        };
+    }
+
     async registerWebhooks(endpoint) {
         const url = String(endpoint || '').trim();
         if (!url) throw new Error('Webhook URL is required');
@@ -370,40 +542,59 @@ class ClickUpWatcher extends EventEmitter {
         const rules = section.rules || {};
         const events = WEBHOOK_EVENTS;
 
+        const adopted = await this._adoptExistingWebhook(client, cfg, url);
+        if (adopted) return adopted;
+
         if (rules.webhookId) {
             try { await client.deleteWebhook(rules.webhookId); } catch { /* may already be removed */ }
         }
 
-        const res = await client.createWebhook(cfg.workspaceId, { endpoint: url, events });
-        const wh = res.webhook || res;
-        const webhookId = wh.id || res.id;
-        const webhookSecret = wh.secret;
-        if (!webhookId || !webhookSecret) {
-            throw new Error('ClickUp did not return webhook id/secret');
+        try {
+            const res = await client.createWebhook(cfg.workspaceId, { endpoint: url, events });
+            const wh = res.webhook || res;
+            const webhookId = wh.id || res.id;
+            const webhookSecret = wh.secret;
+            if (!webhookId || !webhookSecret) {
+                throw new Error('ClickUp did not return webhook id/secret');
+            }
+
+            this.configStore.saveSection('clickup', {
+                rules: {
+                    webhookUrl: url,
+                    webhookId,
+                    webhookSecret,
+                },
+            });
+            this.configStore.reloadIntoProcess();
+
+            log.clickup(`Webhooks registered (${cfg.environment}) → ${url}`);
+            log.clickup(`  Events: ${events.join(', ')}`);
+            return { webhookId, endpoint: url, events, environment: cfg.environment };
+        } catch (err) {
+            if (/already exists/i.test(err.message)) {
+                const retry = await this._adoptExistingWebhook(client, cfg, url);
+                if (retry) return retry;
+            }
+            throw err;
         }
-
-        this.configStore.saveSection('clickup', {
-            rules: {
-                webhookUrl: url,
-                webhookId,
-                webhookSecret,
-            },
-        });
-        this.configStore.reloadIntoProcess();
-
-        console.log(`✓ ClickUp webhooks registered (${cfg.environment}): ${events.join(', ')}`);
-        return { webhookId, endpoint: url, events, environment: cfg.environment };
     }
 
     async handleWebhook({ headers, rawBody, body }) {
         const section = this._rules();
         const rules = section.rules || {};
-        if (!rules.enabled) return { ok: true, skipped: 'disabled' };
+        const event = body?.event || 'unknown';
+        const taskId = body?.task_id || body?.task?.id || '';
+        log.clickup(`Webhook received: ${event}${taskId ? ` (task ${taskId})` : ''}`);
+
+        if (!rules.enabled) {
+            log.clickup('Webhook ignored — ClickUp disabled in settings');
+            return { ok: true, skipped: 'disabled' };
+        }
 
         const secret = rules.webhookSecret;
         const signature = headers['x-signature'] || headers['X-Signature'];
         if (!verifyClickUpSignature(rawBody, signature, secret)) {
-            console.warn('ClickUp webhook: invalid signature');
+            log.clickupWarn('Webhook rejected — invalid signature');
             return { ok: false, error: 'invalid-signature' };
         }
 
@@ -414,11 +605,15 @@ class ClickUpWatcher extends EventEmitter {
         const items = this._historyItems(body);
         const historyId = items.map((i) => i.id).filter(Boolean).join(',') || body.task_id || body.event;
         const dedupKey = `wh:${body.webhook_id || 'wh'}:${historyId}`;
-        if (seen.has(dedupKey)) return { ok: true, skipped: 'duplicate' };
+        if (seen.has(dedupKey)) {
+            log.clickup(`Webhook duplicate ignored: ${dedupKey}`);
+            return { ok: true, skipped: 'duplicate' };
+        }
         seen.add(dedupKey);
 
         const decision = await this._evaluateWebhookEvent(body, rules, myUserId);
         if (decision.notify) {
+            log.clickup(`Webhook alert (${decision.reason}): ${decision.title} — ${decision.message}`);
             await this.alertHub.deliver({
                 source: 'clickup',
                 title: decision.title,
@@ -430,6 +625,7 @@ class ClickUpWatcher extends EventEmitter {
         }
 
         this._saveSeen(cfg.environment, seen);
+        if (!decision.notify) log.clickup(`Webhook processed — no alert (${event})`);
         return { ok: true, notified: Boolean(decision.notify) };
     }
 }
