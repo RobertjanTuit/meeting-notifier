@@ -24,11 +24,18 @@
         .line { padding: 0 0; }
         .err { color: #f48771; }
         .warn { color: #dcdcaa; }
+        .tag-tunnel { color: #4fc1ff; }
+        .tag-webhook { color: #c586c0; }
+        .tag-calendar { color: #4ec9b0; }
+        .tag-clickup { color: #dcdcaa; }
+        .tag-orbit { color: #9cdcfe; }
+        #hint { color: #888; font-size: 11px; }
     </style>
 </head>
 <body>
     <div id="bar">
         <strong>Orbit — Console</strong>
+        <span id="hint">Live activity log</span>
         <span class="spacer"></span>
         <label><input type="checkbox" id="auto" checked /> Auto-scroll</label>
         <button id="clear">Clear</button>
@@ -39,9 +46,22 @@
         const logEl = document.getElementById('log');
         const auto = document.getElementById('auto');
 
+        const TAG_CLASS = {
+            tunnel: 'tag-tunnel',
+            webhook: 'tag-webhook',
+            calendar: 'tag-calendar',
+            clickup: 'tag-clickup',
+            orbit: 'tag-orbit',
+        };
+
         function add(line, level) {
             const div = document.createElement('div');
-            div.className = 'line' + (level === 'error' ? ' err' : level === 'warn' ? ' warn' : '');
+            let cls = 'line';
+            if (level === 'error') cls += ' err';
+            else if (level === 'warn') cls += ' warn';
+            const tagMatch = line.match(/\[(tunnel|webhook|calendar|clickup|orbit)\]/);
+            if (tagMatch && TAG_CLASS[tagMatch[1]]) cls += ` ${TAG_CLASS[tagMatch[1]]}`;
+            div.className = cls;
             div.textContent = line;
             logEl.appendChild(div);
             while (logEl.childNodes.length > 3000) logEl.removeChild(logEl.firstChild);
