@@ -46,6 +46,8 @@ class OrbitNotifier extends EventEmitter {
         this.dataDir = dataDir;
         this.soundPath = soundPath;
         this.calendar = null;
+        this.calendarClients = [];
+        this._pendingAuthAccountId = 'primary';
         this.isBlinking = false;
         this.nextMeeting = null;
         this.currentMeeting = null;
@@ -71,12 +73,29 @@ class OrbitNotifier extends EventEmitter {
         this._zoomIsRunning = value;
         if (value) {
             console.log(chalk.green('✓ Zoom is running'));
-            this.turnOnLights();
         } else {
             console.log(chalk.gray('No active Zoom processes found'));
-            this.turnOffLights();
         }
+        this._syncMeetingLights().catch((err) => {
+            console.error(chalk.red('Error syncing meeting lights:'), err.message);
+        });
         this.emit('zoom-state', value);
+    }
+
+    /** Keep Key Lights on while in a Zoom call; off when idle. */
+    async _syncMeetingLights() {
+        if (this._zoomIsRunning) {
+            await this.turnOnLights();
+        } else {
+            await this.turnOffLights();
+        }
+    }
+
+    _restoreLightAfterPulse(host, original) {
+        if (this._zoomIsRunning) {
+            return this.setElgatoLightData(host, { on: 1 });
+        }
+        return this.setElgatoLightData(host, original?.on === 1 ? original : { on: 0 });
     }
 
     _setStatus(status, error = null) {
@@ -97,7 +116,7 @@ class OrbitNotifier extends EventEmitter {
         this.initializeGoogleCalendar();
         this.restartMeetingPoll();
 
-        if (this.calendar) {
+        if (this.calendarClients.length) {
             const sec = this._meetingPollSeconds();
             console.log(chalk.blue(`📱 Checking for meetings every ${sec} seconds...`));
             this._setStatus('running');
@@ -137,11 +156,33 @@ class OrbitNotifier extends EventEmitter {
         );
     }
 
-    _activateCalendar(oauth2Client) {
-        this.calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-        console.log(chalk.green('✓ Google Calendar authenticated successfully'));
-        this._setStatus('running');
-        this.checkForNextMeeting();
+    _activateCalendar() {
+        if (this.calendarClients.length) {
+            console.log(chalk.green(`✓ Google Calendar authenticated (${this.calendarClients.length} account(s))`));
+            this._setStatus('running');
+            this.checkForNextMeeting();
+        }
+    }
+
+    _readGoogleRules() {
+        try {
+            return JSON.parse(fs.readFileSync(path.join(this.dataDir, 'google-rules.json'), 'utf8'));
+        } catch {
+            return { pollIntervalSeconds: 60, accounts: {} };
+        }
+    }
+
+    _getGoogleAccounts() {
+        const { DEFAULT_GOOGLE_ACCOUNTS } = require('./config-store.js');
+        const rules = this._readGoogleRules();
+        return { ...DEFAULT_GOOGLE_ACCOUNTS, ...(rules.accounts || {}) };
+    }
+
+    _credentialsPathForAccount(accountId) {
+        const acct = this._getGoogleAccounts()[accountId];
+        const file = acct?.credentialsFile
+            || (accountId === 'primary' ? 'credentials.json' : `credentials-${accountId}.json`);
+        return path.join(this.dataDir, file);
     }
 
     /**
@@ -149,8 +190,9 @@ class OrbitNotifier extends EventEmitter {
      * OAuth consent flow. Once tokens are received they are written to disk,
      * the server is shut down, and the calendar is activated automatically.
      */
-    async startAuthServer() {
+    async startAuthServer({ accountId = 'primary' } = {}) {
         if (this._authServer) return;
+        this._pendingAuthAccountId = accountId;
 
         const express = require('express');
         const SCOPES = ['https://www.googleapis.com/auth/calendar.readonly'];
@@ -186,12 +228,16 @@ class OrbitNotifier extends EventEmitter {
             }
             try {
                 const { tokens } = await oauth2Client.getToken(code);
-                fs.writeFileSync(this.credentialsPath, JSON.stringify(tokens, null, 2));
+                const credPath = this._credentialsPathForAccount(this._pendingAuthAccountId);
+                fs.writeFileSync(credPath, JSON.stringify(tokens, null, 2));
                 oauth2Client.setCredentials(tokens);
-                res.send('<h2>✅ Authentication successful!</h2><p>You can close this window. Orbit is now running.</p>');
-                console.log(chalk.green('✓ Authentication completed! Credentials saved.'));
+                const acct = this._getGoogleAccounts()[this._pendingAuthAccountId];
+                const label = acct?.label || this._pendingAuthAccountId;
+                res.send(`<h2>✅ Authentication successful!</h2><p>${label} connected. You can close this window.</p>`);
+                console.log(chalk.green(`✓ Authentication completed for ${label} (${path.basename(credPath)})`));
                 this.stopAuthServer();
-                this._activateCalendar(oauth2Client);
+                this.initializeGoogleCalendar();
+                this._activateCalendar();
             } catch (error) {
                 console.error(chalk.red('Authentication failed:'), error.message);
                 res.status(500).send('Authentication failed: ' + error.message);
@@ -291,26 +337,62 @@ class OrbitNotifier extends EventEmitter {
     }
 
     initializeGoogleCalendar() {
-        const oauth2Client = new google.auth.OAuth2(
-            process.env.GOOGLE_CLIENT_ID,
-            process.env.GOOGLE_CLIENT_SECRET,
-            process.env.GOOGLE_REDIRECT_URI
-        );
+        this.calendarClients = [];
+        const accounts = this._getGoogleAccounts();
 
-        if (!fs.existsSync(this.credentialsPath)) {
+        for (const [accountId, acct] of Object.entries(accounts)) {
+            if (acct.enabled === false) continue;
+            const credPath = path.join(this.dataDir, acct.credentialsFile || `credentials-${accountId}.json`);
+            if (!fs.existsSync(credPath)) continue;
+            try {
+                const oauth2Client = this._createOAuthClient();
+                oauth2Client.setCredentials(JSON.parse(fs.readFileSync(credPath, 'utf8')));
+                this.calendarClients.push({
+                    accountId,
+                    label: acct.label || accountId,
+                    calendar: google.calendar({ version: 'v3', auth: oauth2Client }),
+                });
+            } catch (error) {
+                console.log(chalk.red(`Failed to load credentials for ${accountId}:`), error.message);
+            }
+        }
+
+        this.calendar = this.calendarClients[0]?.calendar || null;
+        if (!this.calendarClients.length) {
             this._setStatus('unauthenticated');
-            return;
         }
+    }
 
-        try {
-            const credentials = JSON.parse(fs.readFileSync(this.credentialsPath, 'utf8'));
-            oauth2Client.setCredentials(credentials);
-            this.calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-            console.log(chalk.green('✓ Google Calendar authenticated successfully'));
-        } catch (error) {
-            console.log(chalk.red('Failed to load credentials:'), error.message);
-            this._setStatus('unauthenticated', error);
+    disconnectGoogleAccount(accountId = 'primary') {
+        const credPath = this._credentialsPathForAccount(accountId);
+        if (fs.existsSync(credPath)) {
+            fs.unlinkSync(credPath);
+            console.log(chalk.yellow(`Disconnected Google account: ${accountId}`));
         }
+        this.initializeGoogleCalendar();
+        if (!this.calendarClients.length) {
+            this._setStatus('unauthenticated');
+        } else {
+            this.checkForNextMeeting();
+        }
+    }
+
+    async resolveCalendarApiFor(calendarId) {
+        const timeMin = new Date().toISOString();
+        for (const client of this.calendarClients) {
+            try {
+                await client.calendar.events.list({
+                    calendarId,
+                    timeMin,
+                    maxResults: 1,
+                    singleEvents: true,
+                });
+                return client.calendar;
+            } catch {
+                // try next account
+            }
+        }
+        return this.calendar;
     }
 
     getCalendarIds() {
@@ -341,8 +423,32 @@ class OrbitNotifier extends EventEmitter {
         return { ...DEFAULT_CALENDAR_CONFIG, ...fileDefaults, ...overrides };
     }
 
+    async _fetchCalendarEvents(calendarId, timeMin, timeMax) {
+        for (const client of this.calendarClients) {
+            try {
+                const response = await client.calendar.events.list({
+                    calendarId,
+                    timeMin,
+                    timeMax,
+                    maxResults: 30,
+                    singleEvents: true,
+                    orderBy: 'startTime',
+                });
+                return (response.data.items || []).map((e) => ({
+                    ...e,
+                    _calendarId: calendarId,
+                    _accountId: client.accountId,
+                }));
+            } catch {
+                // try next Google account
+            }
+        }
+        console.error(chalk.red(`Error fetching calendar "${calendarId}": no connected account has access`));
+        return [];
+    }
+
     async getNextMeeting() {
-        if (!this.calendar) {
+        if (!this.calendarClients.length) {
             throw new Error('Google Calendar not initialized');
         }
 
@@ -360,20 +466,8 @@ class OrbitNotifier extends EventEmitter {
             // calendar doesn't prevent the others from being checked.
             let events = [];
             for (const calendarId of calendarIds) {
-                try {
-                    const response = await this.calendar.events.list({
-                        calendarId,
-                        timeMin,
-                        timeMax,
-                        maxResults: 30,
-                        singleEvents: true,
-                        orderBy: 'startTime',
-                    });
-                    const items = (response.data.items || []).map((e) => ({ ...e, _calendarId: calendarId }));
-                    events.push(...items);
-                } catch (error) {
-                    console.error(chalk.red(`Error fetching calendar "${calendarId}":`), error.message);
-                }
+                const items = await this._fetchCalendarEvents(calendarId, timeMin, timeMax);
+                events.push(...items);
             }
 
             // De-duplicate the same event appearing on multiple calendars
@@ -561,18 +655,21 @@ class OrbitNotifier extends EventEmitter {
                 await this.sleep(duration / 2);
                 if (flash) this.emit('blink-off');
                 if (hasLights) {
-                    await Promise.all(this.keyLights.map((light) => {
-                        const orig = originalStates[light];
-                        return this.setElgatoLightData(light, orig?.on === 1 ? orig : { on: 0 });
-                    }));
+                    await Promise.all(this.keyLights.map((light) =>
+                        this._restoreLightAfterPulse(light, originalStates[light])
+                    ));
                 }
                 if (i < times - 1) await this.sleep(duration / 2);
             }
             if (hasLights) {
                 await this.sleep(500);
-                await Promise.all(this.keyLights.map((light) =>
-                    originalStates[light] ? this.setElgatoLightData(light, originalStates[light]) : null
-                ));
+                if (this._zoomIsRunning) {
+                    await this.turnOnLights();
+                } else {
+                    await Promise.all(this.keyLights.map((light) =>
+                        originalStates[light] ? this.setElgatoLightData(light, originalStates[light]) : null
+                    ));
+                }
             }
         } catch (error) {
             console.error(chalk.red('Error pulsing alert:'), error.message);
@@ -688,7 +785,7 @@ class OrbitNotifier extends EventEmitter {
     }
 
     async checkForNextMeeting() {
-        if (!this.calendar) {
+        if (!this.calendarClients.length) {
             return;
         }
         try {
@@ -723,14 +820,6 @@ class OrbitNotifier extends EventEmitter {
         }
     }
 
-    _readGoogleRules() {
-        try {
-            return JSON.parse(fs.readFileSync(path.join(this.dataDir, 'google-rules.json'), 'utf8'));
-        } catch {
-            return { pollIntervalSeconds: 60 };
-        }
-    }
-
     _meetingPollSeconds() {
         const sec = Number(this._readGoogleRules().pollIntervalSeconds);
         return Number.isFinite(sec) && sec >= 15 ? sec : 60;
@@ -743,7 +832,7 @@ class OrbitNotifier extends EventEmitter {
         }
         const sec = this._meetingPollSeconds();
         this._meetingPollTimer = setInterval(() => {
-            if (!this.calendar) return;
+            if (!this.calendarClients.length) return;
             console.log(chalk.gray('🔄 Checking for meeting updates...'));
             this.checkForNextMeeting();
         }, sec * 1000);
@@ -755,25 +844,41 @@ class OrbitNotifier extends EventEmitter {
 
     reloadCalendarAuth() {
         this.calendar = null;
+        this.calendarClients = [];
         this.initializeGoogleCalendar();
         this.restartMeetingPoll();
-        if (this.calendar) this.checkForNextMeeting();
+        if (this.calendarClients.length) this.checkForNextMeeting();
     }
 
     async listCalendars() {
-        if (!this.calendar) return [];
-        try {
-            const res = await this.calendar.calendarList.list({ minAccessRole: 'reader' });
-            return (res.data.items || []).map((c) => ({
-                id: c.id,
-                summary: c.summary || c.id,
-                primary: Boolean(c.primary),
-                backgroundColor: c.backgroundColor,
-            }));
-        } catch (error) {
-            console.error(chalk.red('Failed to list calendars:'), error.message);
-            return [];
+        if (!this.calendarClients.length) return [];
+        const all = [];
+        const seen = new Set();
+        for (const client of this.calendarClients) {
+            try {
+                const res = await client.calendar.calendarList.list({ minAccessRole: 'reader' });
+                for (const c of res.data.items || []) {
+                    if (seen.has(c.id)) continue;
+                    seen.add(c.id);
+                    all.push({
+                        id: c.id,
+                        summary: c.summary || c.id,
+                        primary: Boolean(c.primary),
+                        backgroundColor: c.backgroundColor,
+                        accountId: client.accountId,
+                        accountLabel: client.label,
+                    });
+                }
+            } catch (error) {
+                console.error(chalk.red(`Failed to list calendars for ${client.accountId}:`), error.message);
+            }
         }
+        return all;
+    }
+
+    async discoverElgatoLights(options) {
+        const { discoverElgatoLights } = require('./elgato-discover.js');
+        return discoverElgatoLights(options);
     }
 
     async blinkLightAt(host, times = 1, duration = 600) {
@@ -787,10 +892,14 @@ class OrbitNotifier extends EventEmitter {
                 await this.setElgatoLightData(host, { on: 1, brightness: BLINK_BRIGHTNESS, temperature: BLINK_TEMPERATURE });
                 await this.sleep(duration / 2);
                 this.emit('blink-off');
-                await this.setElgatoLightData(host, original?.on === 1 ? original : { on: 0 });
+                await this._restoreLightAfterPulse(host, original);
                 if (i < times - 1) await this.sleep(duration / 2);
             }
-            if (original) await this.setElgatoLightData(host, original);
+            if (this._zoomIsRunning) {
+                await this.setElgatoLightData(host, { on: 1 });
+            } else if (original) {
+                await this.setElgatoLightData(host, original);
+            }
         } catch (error) {
             console.error(chalk.red(`Error blinking light ${host}:`), error.message);
             throw error;
