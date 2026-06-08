@@ -1,0 +1,38 @@
+{
+  "enabled": false,
+  "pollIntervalSeconds": 120,
+  "claudeEnabled": true,
+  "minConfidence": 0.8,
+  "skipCategories": [
+    "promotions",
+    "social",
+    "updates"
+  ],
+  "defaultClaudeModel": "claude-haiku-4-5",
+  "accounts": {
+    "personal": {
+      "enabled": true,
+      "email": "",
+      "credentialsFile": "credentials-personal.json",
+      "claudeApiKey": "",
+      "claudeModel": "claude-haiku-4-5",
+      "color": "red",
+      "label": "Personal"
+    },
+    "work": {
+      "enabled": true,
+      "email": "",
+      "credentialsFile": "credentials-work.json",
+      "claudeApiKey": "",
+      "claudeModel": "claude-haiku-4-5",
+      "color": "yellow",
+      "label": "Work"
+    }
+  },
+  "allowlistDomains": [],
+  "blocklistDomains": [],
+  "quietHours": {
+    "start": "22:00",
+    "end": "07:00"
+  }
+}

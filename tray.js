@@ -12,6 +12,11 @@ const {
     dismissEntityId,
 } = require('./push.js');
 const { fixAudio } = require('./audio-fix.js');
+const { createConfigStore } = require('./config-store.js');
+const { AlertHub } = require('./alert-hub.js');
+const { ClickUpWatcher } = require('./clickup.js');
+const { CalendarWatchManager } = require('./calendar-watch.js');
+const { startWebhookServer } = require('./webhook-server.js');
 
 let tray = null;
 let notifier = null;
@@ -19,6 +24,13 @@ let flashWindows = null;
 let isFlashing = false;
 let trayPaths = null;
 let logWindow = null;
+let settingsWindow = null;
+let configStore = null;
+let alertHub = null;
+let clickUpWatcher = null;
+let calendarWatchManager = null;
+let webhookServer = null;
+let settingsHandlersRegistered = false;
 let hudWindow = null;
 let isQuitting = false;
 let menuIsOpen = false;
@@ -266,6 +278,184 @@ function createLogWindow() {
     });
     return logWindow;
 }
+
+
+function createSettingsWindow() {
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+        if (settingsWindow.isMinimized()) settingsWindow.restore();
+        settingsWindow.show();
+        settingsWindow.focus();
+        return settingsWindow;
+    }
+    settingsWindow = new BrowserWindow({
+        width: 920,
+        height: 640,
+        title: 'Orbit — Settings',
+        backgroundColor: '#1e1e1e',
+        webPreferences: { nodeIntegration: true, contextIsolation: false },
+    });
+    settingsWindow.loadFile(path.join(__dirname, 'assets', 'settings.html'));
+    settingsWindow.on('close', (e) => {
+        if (!isQuitting) {
+            e.preventDefault();
+            settingsWindow.hide();
+        }
+    });
+    return settingsWindow;
+}
+
+
+function restartClickUpWatcher() {
+    if (!clickUpWatcher || !configStore) return;
+    clickUpWatcher.restart();
+    setupClickUpWebhooks().catch((err) => console.error('ClickUp webhook setup:', err.message));
+}
+
+async function setupClickUpWebhooks() {
+    if (!configStore || !clickUpWatcher) return;
+    const section = configStore.getSection('clickup');
+    const rules = section.rules || {};
+    if (!rules.enabled || !rules.webhookSecret) return;
+    await ensureWebhookServer();
+}
+
+async function ensureWebhookServer() {
+    const port = Number(process.env.ORBIT_WEBHOOK_PORT) || 3921;
+    if (webhookServer) return webhookServer;
+    try {
+        webhookServer = await startWebhookServer({
+            port,
+            onGoogleCalendarPush: (headers) => {
+                calendarWatchManager?.handlePush(headers);
+            },
+            onClickUpWebhook: (payload) => clickUpWatcher?.handleWebhook?.(payload),
+        });
+        return webhookServer;
+    } catch (err) {
+        console.error('Webhook server failed:', err.message);
+        return null;
+    }
+}
+
+async function setupCalendarPush() {
+    if (!notifier?.calendar || !configStore) return;
+
+    const google = configStore.getSection('google');
+    if (!google.pushEnabled || !google.pushWebhookUrl) {
+        if (calendarWatchManager) await calendarWatchManager.stop();
+        return;
+    }
+
+    if (!(await ensureWebhookServer())) return;
+
+    if (!calendarWatchManager) {
+        calendarWatchManager = new CalendarWatchManager({
+            calendarApi: notifier.calendar,
+            dataDir: trayPaths?.dataDir || configStore.configDir,
+            onChange: () => notifier.checkForNextMeeting(),
+        });
+    }
+
+    await calendarWatchManager.start({
+        calendarIds: google.calendarIds,
+        webhookUrl: google.pushWebhookUrl,
+    });
+}
+
+function applySettingsRestart(flags) {
+    if (!flags || !notifier) return;
+    if (flags.lights && notifier.reinitializeLights) notifier.reinitializeLights();
+    if (flags.calendar) {
+        if (notifier.restartMeetingPoll) notifier.restartMeetingPoll();
+        if (notifier.reloadCalendarAuth) notifier.reloadCalendarAuth();
+        setupCalendarPush().catch((err) => console.error('Calendar push setup:', err.message));
+    }
+    if (flags.clickup) restartClickUpWatcher();
+}
+
+function registerSettingsHandlers() {
+    if (!configStore || settingsHandlersRegistered) return;
+    settingsHandlersRegistered = true;
+
+    ipcMain.handle('settings:get', () => configStore.getAll());
+
+    ipcMain.handle('settings:save', async (_e, { section, patch }) => {
+        try {
+            const { restart } = configStore.saveSection(section, patch);
+            configStore.reloadIntoProcess();
+            applySettingsRestart(restart);
+            if (section === 'clickup') restartClickUpWatcher();
+            return { ok: true, restart };
+        } catch (err) {
+            return { ok: false, error: err.message };
+        }
+    });
+
+    ipcMain.handle('settings:list-calendars', async () => {
+        if (!notifier?.listCalendars) return [];
+        return notifier.listCalendars();
+    });
+
+    ipcMain.handle('settings:test', async (_e, { kind, params }) => {
+        try {
+            if (kind === 'light-blink' && params?.host) {
+                await notifier?.blinkLightAt?.(params.host, 1, 600);
+                return { ok: true };
+            }
+            if (kind === 'push-gentle') {
+                await sendHaPush({ title: 'Orbit test', message: 'Gentle push from Settings', urgent: false });
+                return { ok: true };
+            }
+            if (kind === 'push-urgent') {
+                await sendHaPush({ title: 'Orbit test', message: 'Urgent push from Settings', urgent: true });
+                return { ok: true };
+            }
+            if (kind === 'clickup-connection') {
+                if (!clickUpWatcher) return { ok: false, error: 'ClickUp watcher not initialized' };
+                const info = await clickUpWatcher.testConnection();
+                return { ok: true, info };
+            }
+            if (kind === 'email-classify') {
+                const account = params?.account || 'personal';
+                const cfg = configStore?.getClaudeConfig?.(account);
+                if (!cfg?.apiKey) return { ok: false, error: `No Claude API key for ${account}` };
+                return { ok: true, message: `Key configured for ${account} (${cfg.model}) — classifier not implemented yet` };
+            }
+            if (kind === 'datadog') return { ok: false, error: 'Datadog test not implemented yet' };
+            return { ok: false, error: `Unknown test: ${kind}` };
+        } catch (err) {
+            return { ok: false, error: err.message };
+        }
+    });
+
+    ipcMain.handle('settings:action', async (_e, { action, params = {} }) => {
+        try {
+            if (action === 'google-connect') {
+                if (!notifier) return { ok: false, error: 'Notifier not running' };
+                await notifier.startAuthServer();
+                return { ok: true };
+            }
+            if (action === 'open-help' && trayPaths) {
+                shell.openPath(trayPaths.userData ?? trayPaths.dataDir);
+                return { ok: true };
+            }
+            if (action === 'clickup-register-webhook') {
+                if (!clickUpWatcher) return { ok: false, error: 'ClickUp watcher not initialized' };
+                const section = configStore.getSection('clickup');
+                const endpoint = params.endpoint || section.rules?.webhookUrl;
+                if (!endpoint) return { ok: false, error: 'Set the public webhook URL first' };
+                await ensureWebhookServer();
+                const info = await clickUpWatcher.registerWebhooks(endpoint);
+                restartClickUpWatcher();
+                return { ok: true, info };
+            }
+            return { ok: false, error: `Unknown action: ${action}` };
+        } catch (err) {
+            return { ok: false, error: err.message };
+        }
+    });
+}
+
 
 ipcMain.on('log-ready', (e) => {
     e.sender.send('log-history', logBuffer);
@@ -952,9 +1142,13 @@ function startAlert(meeting) {
     const nagMs = Number(process.env.ORBIT_NAG_MS || process.env.MN_NAG_MS) || 60 * 1000;
     if (alert.nagTimer) clearInterval(alert.nagTimer);
     alert.nagTimer = setInterval(() => {
-        notifier?.blinkLight(2, 600);
         const { title, message, urgent } = pushTextForKind('nag', meeting);
-        maybePushToPhone({ title, message, urgent, meeting });
+        if (alertHub) {
+            alertHub.deliverMeeting({ kind: 'nag', meeting, title, message, urgent }).catch(() => {});
+        } else {
+            notifier?.blinkLight(2, 600);
+            maybePushToPhone({ title, message, urgent, meeting });
+        }
     }, nagMs);
 
     // Auto-dismiss when the meeting link is opened in a browser tab (covers
@@ -1309,6 +1503,10 @@ function buildMenu(paths) {
         },
     });
     items.push({
+        label: 'Settings…',
+        click: () => createSettingsWindow(),
+    });
+    items.push({
         label: 'Show console window',
         click: () => createLogWindow(),
     });
@@ -1444,6 +1642,7 @@ app.whenReady().then(() => {
 
     const paths = resolvePaths();
     trayPaths = paths;
+    configStore = createConfigStore(paths.dataDir);
     loadSettings(paths.dataDir);
     initPresenceTracking();
 
@@ -1465,12 +1664,39 @@ app.whenReady().then(() => {
         dockShown = true;
     }
 
+    registerSettingsHandlers();
+
     notifier = new OrbitNotifier({
         credentialsPath: paths.credentialsPath,
         dataDir: paths.dataDir,
         soundPath: paths.soundPath,
     });
-    notifier.on('status', () => refreshUI(paths));
+
+    alertHub = new AlertHub({
+        configStore,
+        notifier,
+        isAwayFromMac,
+        isPushEnabled: () => pushEnabled,
+        shouldPushForMeeting,
+    });
+
+    clickUpWatcher = new ClickUpWatcher({
+        configStore,
+        alertHub,
+        dataDir: paths.dataDir,
+    });
+
+    alertHub.on('clickup-alert', () => {
+        lastMenuSignature = null;
+        if (trayPaths) refreshUI(trayPaths);
+    });
+
+    notifier.on('status', (status) => {
+        refreshUI(paths);
+        if (status === 'running') {
+            setupCalendarPush().catch((err) => console.error('Calendar push setup:', err.message));
+        }
+    });
     notifier.on('meeting-update', () => refreshUI(paths));
 
     // Detecting an active Zoom meeting (CptHost process) means you've joined,
@@ -1491,10 +1717,12 @@ app.whenReady().then(() => {
 
     notifier.on('notification', async ({ kind, meeting }) => {
         const { title, message, urgent } = pushTextForKind(kind, meeting);
-        await maybePushToPhone({ title, message, urgent, meeting });
+        if (alertHub) {
+            await alertHub.deliverMeeting({ kind, meeting, title, message, urgent });
+        } else {
+            await maybePushToPhone({ title, message, urgent, meeting });
+        }
 
-        // When a meeting starts, raise a blinking red overdue alert — unless you've
-        // already joined (Zoom or meeting link open in a browser).
         if (kind === 'start' && !(await isAlreadyInMeeting(meeting))) startAlert(meeting);
     });
 
@@ -1522,6 +1750,8 @@ app.whenReady().then(() => {
 
     try {
         notifier.start();
+        restartClickUpWatcher();
+        setupCalendarPush().catch((err) => console.error('Calendar push setup:', err.message));
     } catch (error) {
         dialog.showErrorBox('Failed to start Orbit', error.message);
     }

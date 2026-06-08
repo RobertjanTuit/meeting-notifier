@@ -6,6 +6,7 @@ yarn-error.log*
 
 # Environment variables
 .env
+.env.bak
 
 # Google OAuth credentials
 credentials.json
@@ -111,3 +112,15 @@ typings/
 .Trashes
 ehthumbs.db
 Thumbs.db 
+# Orbit rule files (user config)
+clickup-rules.json
+email-rules.json
+datadog-rules.json
+alert-rules.json
+clickup-seen-*.json
+email-seen.json
+email-classifications.json
+credentials-personal.json
+credentials-work.json
+google-rules.json
+google-watch-state.json

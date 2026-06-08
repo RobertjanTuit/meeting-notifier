@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "monitorNamePatterns": [],
+  "monitorTagPatterns": [],
+  "severity": {
+    "warning": "gentle",
+    "alert": "urgent"
+  }
+}

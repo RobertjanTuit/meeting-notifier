@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+    <title>Orbit — Settings</title>
+    <style>
+        :root { color-scheme: dark; }
+        *, *::before, *::after { box-sizing: border-box; }
+        html, body { margin: 0; height: 100%; background: #1e1e1e; color: #d4d4d4; }
+        body {
+            font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            display: flex; flex-direction: column; overflow: hidden;
+        }
+        .layout { flex: 1; display: flex; min-height: 0; }
+        nav {
+            width: 168px; flex-shrink: 0; background: #252526; border-right: 1px solid #333;
+            padding: 8px 0; overflow-y: auto;
+        }
+        nav h1 {
+            margin: 0; padding: 6px 14px 10px; font-size: 12px; font-weight: 600;
+            color: #ccc; letter-spacing: 0.02em;
+        }
+        nav button {
+            display: block; width: 100%; text-align: left; background: none; border: none;
+            color: #aaa; padding: 7px 14px; cursor: pointer; font-size: 13px; border-radius: 0;
+        }
+        nav button:hover { background: #2a2d2e; color: #ddd; }
+        nav button.active { background: #37373d; color: #fff; }
+        main { flex: 1; overflow-y: auto; padding: 20px 24px 16px; min-width: 0; }
+        .panel { display: none; max-width: 640px; }
+        .panel.active { display: block; }
+        .panel h2 { margin: 0 0 4px; font-size: 18px; font-weight: 600; color: #e8e8e8; }
+        .panel .desc { margin: 0 0 18px; color: #888; font-size: 12px; }
+        label.field {
+            display: block; margin-bottom: 14px;
+        }
+        label.field > span {
+            display: block; margin-bottom: 4px; font-size: 12px; color: #aaa;
+        }
+        input[type="text"], input[type="password"], input[type="number"], select, textarea {
+            width: 100%; padding: 6px 8px; background: #3c3c3c; border: 1px solid #555;
+            border-radius: 4px; color: #d4d4d4; font: inherit;
+        }
+        input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus,
+        select:focus, textarea:focus { outline: 1px solid #0e639c; border-color: #0e639c; }
+        input[type="checkbox"] { margin-right: 6px; accent-color: #0e639c; vertical-align: middle; }
+        .inline { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 14px; }
+        .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+        .row input[type="text"] { flex: 1; }
+        button {
+            background: #0e639c; color: #fff; border: none; padding: 6px 12px;
+            border-radius: 4px; cursor: pointer; font-size: 12px;
+        }
+        button:hover { background: #1177bb; }
+        button.secondary { background: #3c3c3c; color: #ccc; }
+        button.secondary:hover { background: #4a4a4a; }
+        button.danger { background: #5a1d1d; color: #f48771; }
+        button.danger:hover { background: #6b2222; }
+        button.small { padding: 4px 8px; font-size: 11px; }
+        .actions { margin-top: 20px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .badges { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+        .badge {
+            font-size: 11px; padding: 3px 8px; border-radius: 10px; background: #333; color: #888;
+        }
+        .badge.ok { background: #1e3a1e; color: #89d185; }
+        .badge.no { background: #3a1e1e; color: #f48771; }
+        .help { font-size: 12px; color: #888; margin: 8px 0 14px; }
+        .help a { color: #3794ff; }
+        .cal-list { max-height: 180px; overflow-y: auto; border: 1px solid #444; border-radius: 4px; padding: 8px; background: #2d2d2d; }
+        .cal-list label { display: block; margin-bottom: 6px; font-size: 12px; color: #ccc; }
+        .cal-list .sub { color: #777; font-size: 11px; }
+        table.matrix { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+        table.matrix th, table.matrix td { border: 1px solid #444; padding: 6px 8px; text-align: center; }
+        table.matrix th { background: #2d2d2d; color: #aaa; font-weight: 500; }
+        table.matrix td:first-child, table.matrix th:first-child { text-align: left; }
+        table.matrix input { margin: 0; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        #statusbar {
+            flex: 0 0 auto; padding: 6px 14px; background: #252526; border-top: 1px solid #333;
+            font-size: 12px; color: #888; min-height: 28px; display: flex; align-items: center;
+        }
+        #statusbar.ok { color: #89d185; }
+        #statusbar.err { color: #f48771; }
+        #statusbar.busy { color: #dcdcaa; }
+        .stub-msg { font-size: 12px; color: #dcdcaa; font-style: italic; }
+        .rule-grid label { display: block; margin-bottom: 8px; font-size: 12px; color: #ccc; }
+    </style>
+</head>
+<body>
+    <div class="layout">
+        <nav>
+            <h1>Orbit Settings</h1>
+            <button type="button" class="tab active" data-tab="lights">Lights</button>
+            <button type="button" class="tab" data-tab="google">Google</button>
+            <button type="button" class="tab" data-tab="homeassistant">Home Assistant</button>
+            <button type="button" class="tab" data-tab="clickup">ClickUp</button>
+            <button type="button" class="tab" data-tab="email">Email</button>
+            <button type="button" class="tab" data-tab="datadog">Datadog</button>
+            <button type="button" class="tab" data-tab="alerts">Alerts</button>
+            <button type="button" class="tab" data-tab="general">General</button>
+        </nav>
+        <main>
+            <!-- Lights -->
+            <section class="panel active" id="panel-lights">
+                <h2>Key Lights</h2>
+                <p class="desc">Elgato Key Light hostnames or IP addresses.</p>
+                <div id="lights-list"></div>
+                <button type="button" class="secondary small" id="lights-add">+ Add light</button>
+                <div class="actions">
+                    <button type="button" data-save="lights">Save</button>
+                </div>
+            </section>
+
+            <!-- Google -->
+            <section class="panel" id="panel-google">
+                <h2>Google Calendar</h2>
+                <p class="desc">OAuth credentials and calendars to watch.</p>
+                <label class="field"><span>Client ID</span><input type="text" id="google-clientId" autocomplete="off" /></label>
+                <label class="field"><span>Client secret</span><input type="password" id="google-clientSecret" autocomplete="off" /></label>
+                <label class="field"><span>Redirect URI</span><input type="text" id="google-redirectUri" autocomplete="off" /></label>
+                <span class="field"><span>Calendars</span></span>
+                <div class="cal-list" id="google-calendars"><em style="color:#666">Loading calendars…</em></div>
+                <div class="badges" id="google-accounts"></div>
+                <label class="field"><span>Poll interval (seconds)</span><input type="number" id="google-pollInterval" min="15" step="1" value="60" /></label>
+                <p class="help">Regular background sync. Default: every 60 seconds.</p>
+                <label class="inline"><input type="checkbox" id="google-pushEnabled" /> Push notifications (instant refresh on calendar changes)</label>
+                <label class="field"><span>Public webhook URL</span><input type="text" id="google-pushWebhookUrl" placeholder="https://your-tunnel/orbit/webhook/google-calendar" /></label>
+                <p class="help">Requires a tunnel (Nabu Casa, Cloudflare) to port <code>3921</code> on this Mac. Orbit registers Google <code>events.watch</code> channels to this URL.</p>
+                <p class="help">Need your own GCP project? See the <a href="#" id="google-help-link">Google Cloud setup guide</a>.</p>
+                <div class="actions">
+                    <button type="button" id="google-connect">Connect Google</button>
+                    <button type="button" data-save="google">Save</button>
+                </div>
+            </section>
+
+            <!-- Home Assistant -->
+            <section class="panel" id="panel-homeassistant">
+                <h2>Home Assistant</h2>
+                <p class="desc">Phone push and dismiss integration.</p>
+                <label class="field"><span>URL</span><input type="text" id="ha-url" placeholder="http://homeassistant.local:8123" /></label>
+                <label class="field"><span>Long-lived access token</span><input type="password" id="ha-token" autocomplete="off" /></label>
+                <label class="field"><span>Notify target</span><input type="text" id="ha-notifyTarget" placeholder="notify.mobile_app_pixel" /></label>
+                <label class="field"><span>Dismiss entity</span><input type="text" id="ha-dismissEntity" placeholder="input_boolean.orbit_dismiss" /></label>
+                <label class="field"><span>Away threshold (seconds)</span><input type="number" id="ha-awayThreshold" min="0" step="1" /></label>
+                <label class="field"><span>Urgent mode</span>
+                    <select id="ha-urgentMode">
+                        <option value="tts">TTS</option>
+                        <option value="critical">Critical notification</option>
+                        <option value="alarm">Alarm stream</option>
+                    </select>
+                </label>
+                <div class="actions">
+                    <button type="button" class="secondary" id="ha-test-gentle">Test gentle push</button>
+                    <button type="button" class="secondary" id="ha-test-urgent">Test urgent push</button>
+                    <button type="button" data-save="homeassistant">Save</button>
+                </div>
+            </section>
+
+            <!-- ClickUp -->
+            <section class="panel" id="panel-clickup">
+                <h2>ClickUp</h2>
+                <p class="desc">Workspace notifications and mention rules.</p>
+                <label class="inline"><input type="checkbox" id="clickup-enabled" /> Enabled</label>
+                <label class="field"><span>Environment</span>
+                    <select id="clickup-env">
+                        <option value="staging">Staging</option>
+                        <option value="production">Production</option>
+                    </select>
+                </label>
+                <label class="field"><span>API token</span><input type="password" id="clickup-token" autocomplete="off" /></label>
+                <label class="field"><span>Workspace ID</span><input type="text" id="clickup-workspaceId" /></label>
+                <label class="field"><span>Poll interval (seconds)</span><input type="number" id="clickup-pollInterval" min="10" step="1" /></label>
+                <label class="field"><span>Watch people (comma-separated user IDs)</span><input type="text" id="clickup-watchPeople" placeholder="12345, 67890" /></label>
+                <label class="field"><span>Watch task tags (comma-separated)</span><input type="text" id="clickup-taskTagMatch" placeholder="urgent, orbit" /></label>
+                <label class="field"><span>Public webhook URL</span><input type="text" id="clickup-webhookUrl" placeholder="https://your-tunnel/orbit/webhook/clickup" /></label>
+                <p class="help">Task events (comments, assignee, tags) need an HTTPS tunnel to port <code>3921</code>. Chat uses polling above.</p>
+                <p class="help" id="clickup-webhook-status"></p>
+                <div class="rule-grid">
+                    <span class="field"><span>Rules</span></span>
+                    <label><input type="checkbox" id="clickup-dmFromPeople" /> DM from watched people</label>
+                    <label><input type="checkbox" id="clickup-mentionMe" /> @mention me</label>
+                    <label><input type="checkbox" id="clickup-mentionMyGroups" /> @mention my groups</label>
+                    <label><input type="checkbox" id="clickup-taskCommentMention" /> Task comment mention</label>
+                    <label><input type="checkbox" id="clickup-taskAssignedToMe" /> Task assigned to me</label>
+                </div>
+                <div class="actions">
+                    <button type="button" class="secondary" id="clickup-test">Test connection</button>
+                    <button type="button" class="secondary" id="clickup-register-webhook">Register webhooks</button>
+                    <button type="button" data-save="clickup">Save</button>
+                </div>
+            </section>
+
+            <!-- Email -->
+            <section class="panel" id="panel-email">
+                <h2>Email</h2>
+                <p class="desc">Claude-assisted inbox triage.</p>
+                <label class="inline"><input type="checkbox" id="email-enabled" /> Enabled</label>
+                <p class="help">One Claude API key per inbox (billing stays separate per account).</p>
+                <fieldset style="border:1px solid #333;border-radius:6px;padding:10px;margin:8px 0">
+                    <legend style="color:#aaa">Personal</legend>
+                    <label class="field"><span>Claude API key</span><input type="password" id="email-claudeKey-personal" autocomplete="off" /></label>
+                    <label class="field"><span>Model</span><input type="text" id="email-claudeModel-personal" placeholder="claude-haiku-4-5" /></label>
+                    <button type="button" class="secondary email-test-account" data-account="personal">Test classify (personal)</button>
+                </fieldset>
+                <fieldset style="border:1px solid #333;border-radius:6px;padding:10px;margin:8px 0">
+                    <legend style="color:#aaa">Work</legend>
+                    <label class="field"><span>Claude API key</span><input type="password" id="email-claudeKey-work" autocomplete="off" /></label>
+                    <label class="field"><span>Model</span><input type="text" id="email-claudeModel-work" placeholder="claude-haiku-4-5" /></label>
+                    <button type="button" class="secondary email-test-account" data-account="work">Test classify (work)</button>
+                </fieldset>
+                <label class="field"><span>Minimum confidence (0–1)</span><input type="number" id="email-minConfidence" min="0" max="1" step="0.05" /></label>
+                <label class="inline"><input type="checkbox" id="email-claudeEnabled" /> Claude classification enabled</label>
+                <label class="field"><span>Skip categories (comma-separated)</span><input type="text" id="email-skipCategories" placeholder="promotions, social, updates" /></label>
+                <div class="actions">
+                    <button type="button" data-save="email">Save</button>
+                </div>
+            </section>
+
+            <!-- Datadog -->
+            <section class="panel" id="panel-datadog">
+                <h2>Datadog</h2>
+                <p class="desc">Monitor alert forwarding.</p>
+                <label class="inline"><input type="checkbox" id="datadog-enabled" /> Enabled</label>
+                <label class="field"><span>API key</span><input type="password" id="datadog-apiKey" autocomplete="off" /></label>
+                <label class="field"><span>Site</span><input type="text" id="datadog-site" placeholder="datadoghq.com" /></label>
+                <div class="actions">
+                    <button type="button" class="secondary" id="datadog-test">Test connection</button>
+                    <button type="button" data-save="datadog">Save</button>
+                </div>
+            </section>
+
+            <!-- Alerts -->
+            <section class="panel" id="panel-alerts">
+                <h2>Alerts</h2>
+                <p class="desc">Quiet hours and per-source delivery channels.</p>
+                <div class="grid-2">
+                    <label class="field"><span>Quiet hours start</span><input type="text" id="alerts-quietStart" placeholder="22:00" /></label>
+                    <label class="field"><span>Quiet hours end</span><input type="text" id="alerts-quietEnd" placeholder="07:00" /></label>
+                </div>
+                <span class="field"><span>Delivery matrix</span></span>
+                <table class="matrix" id="alerts-matrix">
+                    <thead>
+                        <tr>
+                            <th>Source</th>
+                            <th>Lights</th>
+                            <th>Sound</th>
+                            <th>Flash</th>
+                            <th>Push</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr data-source="meetings"><td>Meetings</td><td><input type="checkbox" data-ch="lights" /></td><td><input type="checkbox" data-ch="sound" /></td><td><input type="checkbox" data-ch="flash" /></td><td><input type="checkbox" data-ch="push" /></td></tr>
+                        <tr data-source="clickup"><td>ClickUp</td><td><input type="checkbox" data-ch="lights" /></td><td><input type="checkbox" data-ch="sound" /></td><td><input type="checkbox" data-ch="flash" /></td><td><input type="checkbox" data-ch="push" /></td></tr>
+                        <tr data-source="email"><td>Email</td><td><input type="checkbox" data-ch="lights" /></td><td><input type="checkbox" data-ch="sound" /></td><td><input type="checkbox" data-ch="flash" /></td><td><input type="checkbox" data-ch="push" /></td></tr>
+                        <tr data-source="datadog"><td>Datadog</td><td><input type="checkbox" data-ch="lights" /></td><td><input type="checkbox" data-ch="sound" /></td><td><input type="checkbox" data-ch="flash" /></td><td><input type="checkbox" data-ch="push" /></td></tr>
+                    </tbody>
+                </table>
+                <div class="actions">
+                    <button type="button" data-save="alerts">Save</button>
+                </div>
+            </section>
+
+            <!-- General -->
+            <section class="panel" id="panel-general">
+                <h2>General</h2>
+                <p class="desc">Timezone and audio routing.</p>
+                <label class="field"><span>Timezone</span><input type="text" id="general-timezone" placeholder="America/Los_Angeles" /></label>
+                <label class="field"><span>Audio output device</span><input type="text" id="general-audioOutput" placeholder="BlackHole 2ch" /></label>
+                <label class="field"><span>Audio input device</span><input type="text" id="general-audioInput" placeholder="Elgato Wave Link Chat Mix" /></label>
+                <div class="actions">
+                    <button type="button" data-save="general">Save</button>
+                </div>
+            </section>
+        </main>
+    </div>
+    <div id="statusbar">Ready</div>
+
+    <script>
+        const { ipcRenderer } = require('electron');
+
+        let settings = {};
+        let calendarOptions = [];
+        let statusTimer = null;
+
+        const statusEl = document.getElementById('statusbar');
+        const SOURCE_KEYS = ['meetings', 'clickup', 'email', 'datadog'];
+        const CHANNEL_KEYS = ['lights', 'sound', 'flash', 'push'];
+
+        function setStatus(text, kind) {
+            statusEl.textContent = text;
+            statusEl.className = kind || '';
+            if (statusTimer) clearTimeout(statusTimer);
+            if (kind === 'ok' || kind === 'err') {
+                statusTimer = setTimeout(() => {
+                    statusEl.textContent = 'Ready';
+                    statusEl.className = '';
+                }, 4000);
+            }
+        }
+
+        function activeTab() {
+            return document.querySelector('.tab.active')?.dataset.tab || 'lights';
+        }
+
+        function switchTab(name) {
+            document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
+            document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('active', p.id === `panel-${name}`));
+        }
+
+        document.querySelectorAll('.tab').forEach((btn) => {
+            btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+        });
+
+        function parseCommaList(raw) {
+            return (raw || '').split(',').map((s) => s.trim()).filter(Boolean);
+        }
+
+        function renderLights(hosts) {
+            const list = document.getElementById('lights-list');
+            list.innerHTML = '';
+            const items = hosts?.length ? hosts : [''];
+            items.forEach((host, i) => {
+                const row = document.createElement('div');
+                row.className = 'row';
+                row.innerHTML = `
+                    <input type="text" class="light-ip" value="${escapeAttr(host)}" placeholder="192.168.1.10" />
+                    <button type="button" class="secondary small light-test">Blink</button>
+                    <button type="button" class="danger small light-remove">Remove</button>`;
+                row.querySelector('.light-test').onclick = async () => {
+                    const ip = row.querySelector('.light-ip').value.trim();
+                    if (!ip) return setStatus('Enter an IP address first', 'err');
+                    setStatus(`Testing blink on ${ip}…`, 'busy');
+                    try {
+                        await ipcRenderer.invoke('settings:test', { kind: 'light-blink', params: { host: ip } });
+                        setStatus(`Blink sent to ${ip}`, 'ok');
+                    } catch (e) {
+                        setStatus(e.message || String(e), 'err');
+                    }
+                };
+                row.querySelector('.light-remove').onclick = () => {
+                    row.remove();
+                    if (!list.querySelector('.row')) renderLights(['']);
+                };
+                list.appendChild(row);
+            });
+        }
+
+        function gatherLights() {
+            return {
+                hosts: [...document.querySelectorAll('#lights-list .light-ip')]
+                    .map((el) => el.value.trim())
+                    .filter(Boolean),
+            };
+        }
+
+        function escapeAttr(s) {
+            return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+        }
+
+        function renderGoogleAccounts(accounts) {
+            const el = document.getElementById('google-accounts');
+            el.innerHTML = '';
+            if (!accounts) return;
+            for (const [name, info] of Object.entries(accounts)) {
+                const span = document.createElement('span');
+                span.className = 'badge ' + (info.connected ? 'ok' : 'no');
+                span.textContent = `${name}: ${info.connected ? 'connected' : 'not connected'}`;
+                el.appendChild(span);
+            }
+        }
+
+        function renderCalendarCheckboxes(selectedIds) {
+            const container = document.getElementById('google-calendars');
+            container.innerHTML = '';
+            const selected = new Set(selectedIds || []);
+            if (!calendarOptions.length) {
+                container.innerHTML = '<em style="color:#666">No calendars listed — save credentials and refresh.</em>';
+                return;
+            }
+            calendarOptions.forEach((cal) => {
+                const id = cal.id || cal.calendarId || cal;
+                const summary = typeof cal === 'string' ? cal : (cal.summary || cal.name || id);
+                const label = document.createElement('label');
+                const checked = selected.has(id) ? ' checked' : '';
+                label.innerHTML = `<input type="checkbox" class="cal-cb" value="${escapeAttr(id)}"${checked} /> ${escapeHtml(summary)} <span class="sub">${escapeHtml(id)}</span>`;
+                container.appendChild(label);
+            });
+        }
+
+        function escapeHtml(s) {
+            return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function gatherGoogle() {
+            const calendarIds = [...document.querySelectorAll('#google-calendars .cal-cb:checked')].map((el) => el.value);
+            return {
+                clientId: document.getElementById('google-clientId').value.trim(),
+                clientSecret: document.getElementById('google-clientSecret').value,
+                redirectUri: document.getElementById('google-redirectUri').value.trim(),
+                calendarIds,
+                pollIntervalSeconds: Number(document.getElementById('google-pollInterval').value) || 60,
+                pushEnabled: document.getElementById('google-pushEnabled').checked,
+                pushWebhookUrl: document.getElementById('google-pushWebhookUrl').value.trim(),
+            };
+        }
+
+        function gatherHomeassistant() {
+            return {
+                url: document.getElementById('ha-url').value.trim(),
+                token: document.getElementById('ha-token').value,
+                notifyTarget: document.getElementById('ha-notifyTarget').value.trim(),
+                dismissEntity: document.getElementById('ha-dismissEntity').value.trim(),
+                awayThresholdSeconds: document.getElementById('ha-awayThreshold').value.trim(),
+                urgentMode: document.getElementById('ha-urgentMode').value,
+            };
+        }
+
+        function gatherClickup() {
+            return {
+                env: document.getElementById('clickup-env').value,
+                apiToken: document.getElementById('clickup-token').value,
+                workspaceId: document.getElementById('clickup-workspaceId').value.trim(),
+                rules: {
+                    enabled: document.getElementById('clickup-enabled').checked,
+                    environment: document.getElementById('clickup-env').value,
+                    pollIntervalSeconds: Number(document.getElementById('clickup-pollInterval').value) || 30,
+                    watchPeople: parseCommaList(document.getElementById('clickup-watchPeople').value),
+                    webhookUrl: document.getElementById('clickup-webhookUrl').value.trim(),
+                    rules: {
+                        dmFromPeople: document.getElementById('clickup-dmFromPeople').checked,
+                        mentionMe: document.getElementById('clickup-mentionMe').checked,
+                        mentionMyGroups: document.getElementById('clickup-mentionMyGroups').checked,
+                        taskCommentMention: document.getElementById('clickup-taskCommentMention').checked,
+                        taskAssignedToMe: document.getElementById('clickup-taskAssignedToMe').checked,
+                        taskTagMatch: parseCommaList(document.getElementById('clickup-taskTagMatch').value),
+                    },
+                },
+            };
+        }
+
+        function gatherEmail() {
+            return {
+                accounts: {
+                    personal: {
+                        claudeApiKey: document.getElementById('email-claudeKey-personal').value,
+                        claudeModel: document.getElementById('email-claudeModel-personal').value.trim() || 'claude-haiku-4-5',
+                    },
+                    work: {
+                        claudeApiKey: document.getElementById('email-claudeKey-work').value,
+                        claudeModel: document.getElementById('email-claudeModel-work').value.trim() || 'claude-haiku-4-5',
+                    },
+                },
+                rules: {
+                    enabled: document.getElementById('email-enabled').checked,
+                    claudeEnabled: document.getElementById('email-claudeEnabled').checked,
+                    minConfidence: Number(document.getElementById('email-minConfidence').value) || 0.8,
+                    skipCategories: parseCommaList(document.getElementById('email-skipCategories').value),
+                },
+            };
+        }
+
+        function gatherDatadog() {
+            return {
+                apiKey: document.getElementById('datadog-apiKey').value,
+                site: document.getElementById('datadog-site').value.trim(),
+                rules: { enabled: document.getElementById('datadog-enabled').checked },
+            };
+        }
+
+        function gatherAlerts() {
+            const sources = {};
+            document.querySelectorAll('#alerts-matrix tbody tr').forEach((row) => {
+                const key = row.dataset.source;
+                sources[key] = {};
+                CHANNEL_KEYS.forEach((ch) => {
+                    sources[key][ch] = row.querySelector(`input[data-ch="${ch}"]`).checked;
+                });
+            });
+            const prev = settings.alerts || {};
+            return {
+                ...prev,
+                quietHours: {
+                    ...(prev.quietHours || {}),
+                    start: document.getElementById('alerts-quietStart').value.trim(),
+                    end: document.getElementById('alerts-quietEnd').value.trim(),
+                },
+                sources,
+            };
+        }
+
+        function gatherGeneral() {
+            return {
+                timezone: document.getElementById('general-timezone').value.trim(),
+                audioOutput: document.getElementById('general-audioOutput').value.trim(),
+                audioInput: document.getElementById('general-audioInput').value.trim(),
+            };
+        }
+
+        const gatherers = {
+            lights: gatherLights,
+            google: gatherGoogle,
+            homeassistant: gatherHomeassistant,
+            clickup: gatherClickup,
+            email: gatherEmail,
+            datadog: gatherDatadog,
+            alerts: gatherAlerts,
+            general: gatherGeneral,
+        };
+
+        function populateAll(data) {
+            settings = data || {};
+
+            renderLights(settings.lights?.hosts || []);
+
+            document.getElementById('google-clientId').value = settings.google?.clientId || '';
+            document.getElementById('google-clientSecret').value = settings.google?.clientSecret || '';
+            document.getElementById('google-redirectUri').value = settings.google?.redirectUri || '';
+            renderGoogleAccounts(settings.google?.accounts);
+            renderCalendarCheckboxes(settings.google?.calendarIds);
+            document.getElementById('google-pollInterval').value = settings.google?.pollIntervalSeconds ?? 60;
+            document.getElementById('google-pushEnabled').checked = Boolean(settings.google?.pushEnabled);
+            document.getElementById('google-pushWebhookUrl').value = settings.google?.pushWebhookUrl || '';
+
+            document.getElementById('ha-url').value = settings.homeassistant?.url || '';
+            document.getElementById('ha-token').value = settings.homeassistant?.token || '';
+            document.getElementById('ha-notifyTarget').value = settings.homeassistant?.notifyTarget || '';
+            document.getElementById('ha-dismissEntity').value = settings.homeassistant?.dismissEntity || '';
+            document.getElementById('ha-awayThreshold').value = settings.homeassistant?.awayThresholdSeconds || '300';
+            document.getElementById('ha-urgentMode').value = settings.homeassistant?.urgentMode || 'tts';
+
+            const cu = settings.clickup || {};
+            const cur = cu.rules || {};
+            const crr = cur.rules || {};
+            document.getElementById('clickup-enabled').checked = Boolean(cur.enabled);
+            document.getElementById('clickup-env').value = cu.env || cur.environment || 'staging';
+            document.getElementById('clickup-token').value = cu.apiToken || '';
+            document.getElementById('clickup-workspaceId').value = cu.workspaceId || cur.workspaceId || '';
+            document.getElementById('clickup-pollInterval').value = cur.pollIntervalSeconds ?? 30;
+            document.getElementById('clickup-watchPeople').value = (cur.watchPeople || []).join(', ');
+            document.getElementById('clickup-taskTagMatch').value = (crr.taskTagMatch || []).join(', ');
+            document.getElementById('clickup-webhookUrl').value = cur.webhookUrl || '';
+            const whStatus = document.getElementById('clickup-webhook-status');
+            if (cur.webhookId) {
+                whStatus.textContent = `Webhooks registered (${cur.webhookId.slice(0, 8)}…)`;
+            } else {
+                whStatus.textContent = 'Task webhooks not registered yet.';
+            }
+            document.getElementById('clickup-dmFromPeople').checked = crr.dmFromPeople !== false;
+            document.getElementById('clickup-mentionMe').checked = crr.mentionMe !== false;
+            document.getElementById('clickup-mentionMyGroups').checked = crr.mentionMyGroups !== false;
+            document.getElementById('clickup-taskCommentMention').checked = crr.taskCommentMention !== false;
+            document.getElementById('clickup-taskAssignedToMe').checked = crr.taskAssignedToMe !== false;
+
+            const em = settings.email || {};
+            const emr = em.rules || {};
+            const ema = emr.accounts || {};
+            document.getElementById('email-enabled').checked = Boolean(emr.enabled);
+            document.getElementById('email-claudeKey-personal').value = ema.personal?.claudeApiKey || '';
+            document.getElementById('email-claudeModel-personal').value = ema.personal?.claudeModel || '';
+            document.getElementById('email-claudeKey-work').value = ema.work?.claudeApiKey || '';
+            document.getElementById('email-claudeModel-work').value = ema.work?.claudeModel || '';
+            document.getElementById('email-minConfidence').value = emr.minConfidence ?? 0.8;
+            document.getElementById('email-claudeEnabled').checked = emr.claudeEnabled !== false;
+            document.getElementById('email-skipCategories').value = (emr.skipCategories || []).join(', ');
+
+            const dd = settings.datadog || {};
+            const ddr = dd.rules || {};
+            document.getElementById('datadog-enabled').checked = Boolean(ddr.enabled);
+            document.getElementById('datadog-apiKey').value = dd.apiKey || '';
+            document.getElementById('datadog-site').value = dd.site || 'datadoghq.com';
+
+            const al = settings.alerts || {};
+            document.getElementById('alerts-quietStart').value = al.quietHours?.start || '22:00';
+            document.getElementById('alerts-quietEnd').value = al.quietHours?.end || '07:00';
+            SOURCE_KEYS.forEach((src) => {
+                const row = document.querySelector(`#alerts-matrix tr[data-source="${src}"]`);
+                if (!row) return;
+                const srcCfg = al.sources?.[src] || {};
+                CHANNEL_KEYS.forEach((ch) => {
+                    const cb = row.querySelector(`input[data-ch="${ch}"]`);
+                    if (cb) cb.checked = srcCfg[ch] !== false;
+                });
+            });
+
+            document.getElementById('general-timezone').value = settings.general?.timezone || '';
+            document.getElementById('general-audioOutput').value = settings.general?.audioOutput || '';
+            document.getElementById('general-audioInput').value = settings.general?.audioInput || '';
+        }
+
+        async function saveSection(section) {
+            const gather = gatherers[section];
+            if (!gather) return;
+            setStatus('Saving…', 'busy');
+            try {
+                const patch = gather();
+                const result = await ipcRenderer.invoke('settings:save', { section, patch });
+                settings[section] = { ...(settings[section] || {}), ...patch };
+                if (section === 'google' && patch.calendarIds) {
+                    settings.google = { ...settings.google, calendarIds: patch.calendarIds };
+                }
+                setStatus(result?.message || 'Saved', 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        }
+
+        document.querySelectorAll('[data-save]').forEach((btn) => {
+            btn.addEventListener('click', () => saveSection(btn.dataset.save));
+        });
+
+        document.getElementById('lights-add').onclick = () => {
+            const list = document.getElementById('lights-list');
+            const hosts = [...list.querySelectorAll('.light-ip')].map((el) => el.value);
+            hosts.push('');
+            renderLights(hosts);
+        };
+
+        document.getElementById('google-connect').onclick = async () => {
+            setStatus('Opening Google OAuth…', 'busy');
+            try {
+                await ipcRenderer.invoke('settings:action', { action: 'google-connect', params: {} });
+                setStatus('Google connect flow started', 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        };
+
+        document.getElementById('google-help-link').onclick = (e) => {
+            e.preventDefault();
+            ipcRenderer.invoke('settings:action', { action: 'open-help', params: { topic: 'google-gcp' } }).catch(() => {});
+        };
+
+        document.getElementById('ha-test-gentle').onclick = async () => {
+            setStatus('Sending gentle push…', 'busy');
+            try {
+                await ipcRenderer.invoke('settings:test', { kind: 'push-gentle', params: {} });
+                setStatus('Gentle push sent', 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        };
+
+        document.getElementById('ha-test-urgent').onclick = async () => {
+            setStatus('Sending urgent push…', 'busy');
+            try {
+                await ipcRenderer.invoke('settings:test', { kind: 'push-urgent', params: {} });
+                setStatus('Urgent push sent', 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        };
+
+        document.getElementById('clickup-register-webhook').onclick = async () => {
+            setStatus('Registering ClickUp webhooks…', 'busy');
+            try {
+                const patch = gatherClickup();
+                await ipcRenderer.invoke('settings:save', { section: 'clickup', patch });
+                const res = await ipcRenderer.invoke('settings:action', { action: 'clickup-register-webhook', params: {} });
+                if (!res?.ok) throw new Error(res?.error || 'Registration failed');
+                const i = res.info || {};
+                setStatus(`Webhooks registered (${i.environment}): ${(i.events || []).join(', ')}`, 'ok');
+                const data = await ipcRenderer.invoke('settings:get');
+                populateAll(data);
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        };
+
+        document.getElementById('clickup-test').onclick = async () => {
+            setStatus('Testing ClickUp connection…', 'busy');
+            try {
+                const patch = gatherClickup();
+                await ipcRenderer.invoke('settings:save', { section: 'clickup', patch });
+                const res = await ipcRenderer.invoke('settings:test', { kind: 'clickup-connection', params: {} });
+                if (!res?.ok) throw new Error(res?.error || 'Test failed');
+                const i = res.info || {};
+                setStatus(`Connected (${i.environment}): ${i.username} — ${i.channelCount} channels @ ${i.baseUrl}`, 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        };
+
+        document.querySelectorAll('.email-test-account').forEach((btn) => {
+            btn.onclick = async () => {
+                const account = btn.dataset.account;
+                setStatus(`Test classify (${account})…`, 'busy');
+                try {
+                    await ipcRenderer.invoke('settings:save', { section: 'email', patch: gatherEmail() });
+                    const res = await ipcRenderer.invoke('settings:test', { kind: 'email-classify', params: { account } });
+                    if (!res?.ok) throw new Error(res?.error || 'Test failed');
+                    setStatus(res.message || 'Classifier not implemented yet', res.message?.includes('not implemented') ? 'busy' : 'ok');
+                } catch (e) {
+                    setStatus(e.message || String(e), 'err');
+                }
+            };
+        });
+
+        document.getElementById('datadog-test').onclick = async () => {
+            setStatus('Datadog test (stub)…', 'busy');
+            try {
+                await ipcRenderer.invoke('settings:test', { kind: 'datadog', params: {} });
+                setStatus('Datadog test stub invoked', 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        };
+
+        async function loadCalendars() {
+            try {
+                calendarOptions = await ipcRenderer.invoke('settings:list-calendars') || [];
+                renderCalendarCheckboxes(settings.google?.calendarIds);
+            } catch {
+                calendarOptions = [];
+                renderCalendarCheckboxes(settings.google?.calendarIds);
+            }
+        }
+
+        async function init() {
+            setStatus('Loading settings…', 'busy');
+            try {
+                settings = await ipcRenderer.invoke('settings:get') || {};
+                populateAll(settings);
+                await loadCalendars();
+                setStatus('Ready', '');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        }
+
+        init();
+    </script>
+</body>
+</html>

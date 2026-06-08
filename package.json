@@ -1,7 +1,7 @@
 {
   "name": "orbit",
   "version": "1.0.0",
-  "description": "Orbit — menu bar meeting alerts with Google Calendar, Elgato lights, and Home Assistant phone push",
+  "description": "Orbit \u2014 menu bar meeting alerts with Google Calendar, Elgato lights, and Home Assistant phone push",
   "main": "tray.js",
   "scripts": {
     "start": "node index.js",
@@ -43,7 +43,15 @@
       "assets/log.html",
       "sounds/**/*",
       "node_modules/**/*",
-      "package.json"
+      "package.json",
+      "config-store.js",
+      "assets/settings.html",
+      "*-rules.example.json",
+      "alert-hub.js",
+      "clickup.js",
+      "clickup-config.js",
+      "calendar-watch.js",
+      "webhook-server.js"
     ],
     "asarUnpack": [
       "sounds/**/*",
@@ -60,7 +68,10 @@
       "target": [
         {
           "target": "dmg",
-          "arch": ["arm64", "x64"]
+          "arch": [
+            "arm64",
+            "x64"
+          ]
         }
       ],
       "extendInfo": {

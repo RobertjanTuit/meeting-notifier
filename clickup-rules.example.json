@@ -1,0 +1,20 @@
+{
+  "enabled": false,
+  "environment": "staging",
+  "workspaceId": "333",
+  "myUserId": null,
+  "pollIntervalSeconds": 30,
+  "watchChannelIds": [],
+  "watchPeople": [],
+  "webhookUrl": "",
+  "webhookId": null,
+  "webhookSecret": "",
+  "rules": {
+    "dmFromPeople": true,
+    "mentionMe": true,
+    "mentionMyGroups": true,
+    "taskCommentMention": true,
+    "taskAssignedToMe": true,
+    "taskTagMatch": []
+  }
+}

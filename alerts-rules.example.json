@@ -1,0 +1,33 @@
+{
+  "quietHours": {
+    "start": "22:00",
+    "end": "07:00",
+    "timezone": "America/Los_Angeles"
+  },
+  "sources": {
+    "meetings": {
+      "lights": true,
+      "sound": true,
+      "flash": true,
+      "push": true
+    },
+    "clickup": {
+      "lights": true,
+      "sound": true,
+      "flash": false,
+      "push": true
+    },
+    "email": {
+      "lights": true,
+      "sound": false,
+      "flash": false,
+      "push": true
+    },
+    "datadog": {
+      "lights": true,
+      "sound": true,
+      "flash": true,
+      "push": false
+    }
+  }
+}

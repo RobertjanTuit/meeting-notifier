@@ -57,6 +57,7 @@ class OrbitNotifier extends EventEmitter {
         this._zoomIsRunning = null;
         this._zoomCheckInterval = null;
         this._meetingPollTask = null;
+        this._meetingPollTimer = null;
         this._authServer = null;
         this.authUrl = null;
     }
@@ -93,16 +94,12 @@ class OrbitNotifier extends EventEmitter {
             this.checkIfZoomRunning();
         }, 1000);
 
-        this._meetingPollTask = cron.schedule('*/1 * * * *', () => {
-            if (!this.calendar) return;
-            console.log(chalk.gray('🔄 Checking for meeting updates...'));
-            this.checkForNextMeeting();
-        });
-
         this.initializeGoogleCalendar();
+        this.restartMeetingPoll();
 
         if (this.calendar) {
-            console.log(chalk.blue('📱 Checking for meetings every 1 minute...'));
+            const sec = this._meetingPollSeconds();
+            console.log(chalk.blue(`📱 Checking for meetings every ${sec} seconds...`));
             this._setStatus('running');
             this.checkForNextMeeting();
         } else if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
@@ -122,6 +119,10 @@ class OrbitNotifier extends EventEmitter {
         if (this._meetingPollTask?.destroy) {
             this._meetingPollTask.destroy();
             this._meetingPollTask = null;
+        }
+        if (this._meetingPollTimer) {
+            clearInterval(this._meetingPollTimer);
+            this._meetingPollTimer = null;
         }
         this.stopAuthServer();
         this.clearScheduledNotifications();
@@ -533,15 +534,11 @@ class OrbitNotifier extends EventEmitter {
      * the light, sound and screen together. Works even with no lights configured
      * (sound + screen still pulse).
      */
-    async blinkLight(times = 1, duration = 1000) {
+
+    async pulseAlert(times = 1, duration = 1000, { lights = true, sound = true, flash = true } = {}) {
         if (this.isBlinking) return;
-
-        const hasLights = this.keyLights.length > 0;
+        const hasLights = lights && this.keyLights.length > 0;
         this.isBlinking = true;
-        if (hasLights) {
-            console.log(chalk.blue(`💡 Blinking ${this.keyLights.length} light(s) ${times} time(s)`));
-        }
-
         try {
             const originalStates = {};
             if (hasLights) {
@@ -549,11 +546,9 @@ class OrbitNotifier extends EventEmitter {
                     originalStates[light] = (await this.getElgatoLightData(light))?.lights?.[0];
                 }
             }
-
             for (let i = 0; i < times; i++) {
-                // Fire all three together: sound, screen (via event), and lights.
-                this.playDingSound();
-                this.emit('blink-on');
+                if (sound) this.playDingSound();
+                if (flash) this.emit('blink-on');
                 if (hasLights) {
                     await Promise.all(this.keyLights.map((light) =>
                         this.setElgatoLightData(light, {
@@ -563,24 +558,16 @@ class OrbitNotifier extends EventEmitter {
                         })
                     ));
                 }
-
                 await this.sleep(duration / 2);
-
-                this.emit('blink-off');
+                if (flash) this.emit('blink-off');
                 if (hasLights) {
-                    // Dip back to the light's original state instead of full black,
-                    // so a light that was already on just returns to normal.
                     await Promise.all(this.keyLights.map((light) => {
                         const orig = originalStates[light];
                         return this.setElgatoLightData(light, orig?.on === 1 ? orig : { on: 0 });
                     }));
                 }
-
-                if (i < times - 1) {
-                    await this.sleep(duration / 2);
-                }
+                if (i < times - 1) await this.sleep(duration / 2);
             }
-
             if (hasLights) {
                 await this.sleep(500);
                 await Promise.all(this.keyLights.map((light) =>
@@ -588,10 +575,14 @@ class OrbitNotifier extends EventEmitter {
                 ));
             }
         } catch (error) {
-            console.error(chalk.red('Error controlling lights:'), error.message);
+            console.error(chalk.red('Error pulsing alert:'), error.message);
         } finally {
             this.isBlinking = false;
         }
+    }
+
+    async blinkLight(times = 1, duration = 1000) {
+        return this.pulseAlert(times, duration, { lights: true, sound: true, flash: true });
     }
 
     sleep(ms) {
@@ -642,7 +633,6 @@ class OrbitNotifier extends EventEmitter {
             const cronTime = fiveMinutesBefore.format('s m H D M d');
             const task1 = cron.schedule(cronTime, () => {
                 console.log(chalk.yellow('🔔 5 minutes until meeting!'));
-                this.blinkLight(1, 2000);
                 this.emit('notification', { kind: '5min', meeting });
             }, { scheduled: false });
 
@@ -656,7 +646,6 @@ class OrbitNotifier extends EventEmitter {
             const cronTime = oneMinuteBefore.format('s m H D M d');
             const task2 = cron.schedule(cronTime, () => {
                 console.log(chalk.yellow('🔔 1 minute until meeting!'));
-                this.blinkLight(2, 1500);
                 this.emit('notification', { kind: '1min', meeting });
             }, { scheduled: false });
 
@@ -668,7 +657,6 @@ class OrbitNotifier extends EventEmitter {
         const cronTime = meetingTime.format('s m H D M d');
         const task3 = cron.schedule(cronTime, async () => {
             console.log(chalk.red('🔔 Meeting starting now!'));
-            await this.blinkLight(5, 1000);
             if (cfg.autoOpen) this.openMeetingVideo(meeting);
             this.emit('notification', { kind: 'start', meeting });
         }, { scheduled: false });
@@ -732,6 +720,82 @@ class OrbitNotifier extends EventEmitter {
         } catch (error) {
             console.error(chalk.red('Error checking for meetings:'), error.message);
             this._setStatus('error', error);
+        }
+    }
+
+    _readGoogleRules() {
+        try {
+            return JSON.parse(fs.readFileSync(path.join(this.dataDir, 'google-rules.json'), 'utf8'));
+        } catch {
+            return { pollIntervalSeconds: 60 };
+        }
+    }
+
+    _meetingPollSeconds() {
+        const sec = Number(this._readGoogleRules().pollIntervalSeconds);
+        return Number.isFinite(sec) && sec >= 15 ? sec : 60;
+    }
+
+    restartMeetingPoll() {
+        if (this._meetingPollTimer) {
+            clearInterval(this._meetingPollTimer);
+            this._meetingPollTimer = null;
+        }
+        const sec = this._meetingPollSeconds();
+        this._meetingPollTimer = setInterval(() => {
+            if (!this.calendar) return;
+            console.log(chalk.gray('🔄 Checking for meeting updates...'));
+            this.checkForNextMeeting();
+        }, sec * 1000);
+    }
+
+    reinitializeLights() {
+        this.initializeElgatoLights();
+    }
+
+    reloadCalendarAuth() {
+        this.calendar = null;
+        this.initializeGoogleCalendar();
+        this.restartMeetingPoll();
+        if (this.calendar) this.checkForNextMeeting();
+    }
+
+    async listCalendars() {
+        if (!this.calendar) return [];
+        try {
+            const res = await this.calendar.calendarList.list({ minAccessRole: 'reader' });
+            return (res.data.items || []).map((c) => ({
+                id: c.id,
+                summary: c.summary || c.id,
+                primary: Boolean(c.primary),
+                backgroundColor: c.backgroundColor,
+            }));
+        } catch (error) {
+            console.error(chalk.red('Failed to list calendars:'), error.message);
+            return [];
+        }
+    }
+
+    async blinkLightAt(host, times = 1, duration = 600) {
+        if (!host || this.isBlinking) return;
+        this.isBlinking = true;
+        try {
+            const original = (await this.getElgatoLightData(host))?.lights?.[0];
+            for (let i = 0; i < times; i++) {
+                this.playDingSound();
+                this.emit('blink-on');
+                await this.setElgatoLightData(host, { on: 1, brightness: BLINK_BRIGHTNESS, temperature: BLINK_TEMPERATURE });
+                await this.sleep(duration / 2);
+                this.emit('blink-off');
+                await this.setElgatoLightData(host, original?.on === 1 ? original : { on: 0 });
+                if (i < times - 1) await this.sleep(duration / 2);
+            }
+            if (original) await this.setElgatoLightData(host, original);
+        } catch (error) {
+            console.error(chalk.red(`Error blinking light ${host}:`), error.message);
+            throw error;
+        } finally {
+            this.isBlinking = false;
         }
     }
 }

@@ -1,0 +1,5 @@
+{
+  "pollIntervalSeconds": 60,
+  "pushEnabled": false,
+  "pushWebhookUrl": "https://your-tunnel.example.com/orbit/webhook/google-calendar"
+}
