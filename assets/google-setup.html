@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>Orbit — Google Cloud Setup</title>
+    <style>
+        :root { color-scheme: dark; }
+        body {
+            margin: 0; padding: 24px 28px 32px;
+            font: 14px/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #1e1e1e; color: #d4d4d4; max-width: 640px;
+        }
+        h1 { margin: 0 0 6px; font-size: 20px; color: #e8e8e8; }
+        .lead { color: #888; margin: 0 0 24px; font-size: 13px; }
+        h2 { margin: 24px 0 8px; font-size: 15px; color: #ccc; }
+        ol { margin: 0; padding-left: 1.25rem; }
+        li { margin-bottom: 10px; }
+        code {
+            background: #2d2d2d; border: 1px solid #444; border-radius: 3px;
+            padding: 1px 5px; font-size: 12px;
+        }
+        a { color: #3794ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .links { margin-top: 20px; display: flex; flex-wrap: wrap; gap: 10px; }
+        .links button {
+            background: #0e639c; color: #fff; border: none; padding: 8px 12px;
+            border-radius: 4px; cursor: pointer; font-size: 12px;
+        }
+        .links button:hover { background: #1177bb; }
+        .links button.secondary { background: #3c3c3c; color: #ccc; }
+        .links button.secondary:hover { background: #4a4a4a; }
+        .note {
+            margin-top: 20px; padding: 10px 12px; background: #2a2a2a;
+            border: 1px solid #444; border-radius: 4px; font-size: 12px; color: #aaa;
+        }
+    </style>
+</head>
+<body>
+    <h1>Google Cloud setup</h1>
+    <p class="lead">Create OAuth credentials so Orbit can read your calendars.</p>
+
+    <h2>Steps</h2>
+    <ol>
+        <li>Open <strong>Google Cloud Console</strong> and create or select a project.</li>
+        <li>Enable the <strong>Google Calendar API</strong> for that project.</li>
+        <li>Configure the <strong>OAuth consent screen</strong> (External is fine for personal use; add yourself as a test user if in Testing mode).</li>
+        <li>Create an <strong>OAuth 2.0 Client ID</strong> → Application type: <strong>Desktop app</strong> (or Web application if you prefer).</li>
+        <li>Add this <strong>Authorized redirect URI</strong>:<br />
+            <code id="redirect-uri">http://localhost:3000/oauth2callback</code></li>
+        <li>Copy the <strong>Client ID</strong> and <strong>Client secret</strong> into Orbit Settings → Google.</li>
+        <li>Click <strong>Save</strong>, then <strong>Connect</strong> on each account (Primary, Personal, Work) you need.</li>
+    </ol>
+
+    <div class="links">
+        <button type="button" data-url="https://console.cloud.google.com/">Cloud Console</button>
+        <button type="button" data-url="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com">Enable Calendar API</button>
+        <button type="button" data-url="https://console.cloud.google.com/apis/credentials">Credentials</button>
+        <button type="button" data-url="https://developers.google.com/calendar/api/guides/auth">API auth docs</button>
+    </div>
+
+    <p class="note">
+        Redirect URI must match exactly what you enter in Settings. Orbit runs a local server on port 3000 during sign-in.
+        Tokens are saved per account in your config folder (e.g. <code>credentials-personal.json</code>).
+    </p>
+
+    <script>
+        const { shell, ipcRenderer } = require('electron');
+
+        document.querySelectorAll('[data-url]').forEach((btn) => {
+            btn.onclick = () => shell.openExternal(btn.dataset.url);
+        });
+
+        ipcRenderer.invoke('settings:get').then((data) => {
+            const uri = data?.google?.redirectUri;
+            if (uri) document.getElementById('redirect-uri').textContent = uri;
+        }).catch(() => {});
+    </script>
+</body>
+</html>
