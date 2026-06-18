@@ -125,3 +125,6 @@ credentials-work.json
 google-rules.json
 google-watch-state.json
 tunnel-rules.json
+
+# Compiled native helpers (built via npm run build:camera)
+bin/
