@@ -4,6 +4,15 @@
     "end": "07:00",
     "timezone": "America/Los_Angeles"
   },
+  "desktopNotifications": false,
+  "floatingAlertBanner": true,
+  "sounds": {
+    "default": "",
+    "meetings": "",
+    "clickup": "",
+    "email": "",
+    "datadog": ""
+  },
   "sources": {
     "meetings": {
       "lights": true,
