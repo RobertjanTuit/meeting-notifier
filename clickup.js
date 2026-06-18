@@ -305,6 +305,18 @@ class ClickUpWatcher extends EventEmitter {
         return String(content).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
     }
 
+    /** First N space-separated words of a string, trimmed. */
+    _firstWords(text, n) {
+        return String(text || '').replace(/\s+/g, ' ').trim().split(' ').slice(0, n).join(' ');
+    }
+
+    /** Short phrase for phone TTS, e.g. "Zeb in General" / "Alex in Bug fix". */
+    _spokenPhrase(who, place) {
+        const w = this._firstWords(who, 1) || 'Someone';
+        const p = this._firstWords(place, 3);
+        return p ? `${w} in ${p}` : w;
+    }
+
     async _shouldAlert(msg, rules, client, myUserId) {
         const r = rules.rules || {};
         const senderId = String(msg.user_id || '');
@@ -360,14 +372,21 @@ class ClickUpWatcher extends EventEmitter {
                 const decision = await this._shouldAlert(msg, rules, client, myUserId);
                 if (!decision.notify) continue;
 
-                log.clickup(`Chat alert (${decision.reason}) in #${channel.name || channel.id}: ${this._snippet(msg.content)}`);
+                const channelName = channel.name || channel.id;
+                log.clickup(`Chat alert (${decision.reason}) in #${channelName}: ${this._snippet(msg.content)}`);
+
+                const senderName = msg.user?.username || msg.username || this._memberLabel(msg.user_id);
+                const spoken = decision.reason === 'dm-from-watched-person'
+                    ? this._spokenPhrase(senderName, channelName)
+                    : `Mention in ${this._firstWords(channelName, 3)}`;
 
                 await this.alertHub.deliver({
                     source: 'clickup',
-                    title: `ClickUp: ${channel.name || channel.id}`,
+                    title: `ClickUp: ${channelName}`,
                     message: this._snippet(msg.content) || '(no text)',
                     urgent: Boolean(decision.urgent),
                     url: `https://app.clickup.com/${cfg.workspaceId}/chat/r/${channel.id}`,
+                    spoken,
                     meta: { reason: decision.reason, messageId: msg.id },
                 });
             }
@@ -440,6 +459,7 @@ class ClickUpWatcher extends EventEmitter {
                         urgent: true,
                         title: `ClickUp: Assigned — ${taskName}`,
                         message: 'You were assigned to a task',
+                        spoken: `Assigned ${this._firstWords(taskName, 4)}`,
                         taskId,
                     };
                 }
@@ -458,6 +478,7 @@ class ClickUpWatcher extends EventEmitter {
                             urgent: true,
                             title: `ClickUp: Tag — ${taskName}`,
                             message: `Tag matched: ${tags.join(', ')}`,
+                            spoken: `Tag on ${this._firstWords(taskName, 4)}`,
                             taskId,
                         };
                     }
@@ -470,12 +491,14 @@ class ClickUpWatcher extends EventEmitter {
                 const text = this._commentText(item);
                 const authorId = String(item.user?.id || item.user_id || '');
                 if (watchIds.size && r.dmFromPeople && watchIds.has(authorId)) {
+                    const author = item.user?.username || this._memberLabel(authorId);
                     return {
                         notify: true,
                         reason: 'task-comment-from-watched-person',
                         urgent: false,
                         title: `ClickUp: Comment — ${taskName}`,
                         message: this._snippet(text) || '(comment)',
+                        spoken: this._spokenPhrase(author, taskName),
                         taskId,
                     };
                 }
@@ -486,6 +509,7 @@ class ClickUpWatcher extends EventEmitter {
                         urgent: true,
                         title: `ClickUp: Mention — ${taskName}`,
                         message: this._snippet(text) || '(comment)',
+                        spoken: `Mention in ${this._firstWords(taskName, 4)}`,
                         taskId,
                     };
                 }
@@ -620,6 +644,7 @@ class ClickUpWatcher extends EventEmitter {
                 message: decision.message,
                 urgent: Boolean(decision.urgent),
                 url: decision.taskId ? this._taskUrl(cfg.workspaceId, decision.taskId) : undefined,
+                spoken: decision.spoken,
                 meta: { reason: decision.reason, event: body.event, taskId: decision.taskId },
             });
         }

@@ -1,0 +1,24 @@
+# Paste THIS FILE ONLY into:
+# Settings → Automations & scenes → Automations → Create automation → ⋮ → Edit in YAML
+#
+# Prerequisite: create the helper first (Settings → Helpers → Toggle):
+#   entity_id: input_boolean.orbit_phone_push
+#
+# Handles the "Pause 1h" action on Orbit notifications: turns push off, then
+# re-enables it automatically after one hour.
+
+alias: Orbit — pause phone push for 1 hour
+mode: restart
+trigger:
+  - platform: event
+    event_type: mobile_app_notification_action
+    event_data:
+      action: ORBIT_PAUSE_1H
+action:
+  - service: input_boolean.turn_off
+    target:
+      entity_id: input_boolean.orbit_phone_push
+  - delay: "01:00:00"
+  - service: input_boolean.turn_on
+    target:
+      entity_id: input_boolean.orbit_phone_push

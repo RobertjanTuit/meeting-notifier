@@ -1,0 +1,44 @@
+# Phone-side master switch for Orbit phone push.
+#
+# When this toggle is OFF, the Mac will NOT send any phone push (meetings,
+# ClickUp, etc.) — even when you're away. Flip it from the Home Assistant app,
+# a dashboard card, or a home-screen shortcut. Orbit reads it before every push
+# and fails open: if the helper doesn't exist, pushing still works as before.
+#
+# ── STEP 1 — Create the helper (UI) ───────────────────────────────────────────
+#   Settings → Devices & services → Helpers → Create helper → Toggle
+#   Name: Orbit Phone Push
+#   Entity ID: input_boolean.orbit_phone_push
+#   (Leave it ON to receive pushes.)
+#
+# ── STEP 2 (optional) — "Pause" automations ───────────────────────────────────
+#   Paste ha/orbit-phone-push-automation.yaml into
+#   Settings → Automations → Create → Edit in YAML.
+#   Adds notification "Pause 1h" handling + auto re-enable.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# The block below is a configuration.yaml *package* (only if you use packages/).
+# Most users should follow STEP 1/STEP 2 above instead of pasting this whole file.
+
+input_boolean:
+  orbit_phone_push:
+    name: Orbit Phone Push
+    icon: mdi:cellphone-message
+
+automation:
+  - id: orbit_phone_push_pause_1h
+    alias: Orbit — pause phone push for 1 hour
+    mode: restart
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: ORBIT_PAUSE_1H
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.orbit_phone_push
+      - delay: "01:00:00"
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.orbit_phone_push
