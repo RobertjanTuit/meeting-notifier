@@ -6,11 +6,11 @@
     "warnNoLink": true,
     "push": true
   },
-  "robertjan.tuit@gmail.com": {
+  "you@gmail.com": {
     "warnNoLink": false,
     "color": "red"
   },
-  "rj@clickup.com": {
+  "you@company.com": {
     "color": "yellow"
   }
 }
