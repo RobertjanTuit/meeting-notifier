@@ -1,15 +1,16 @@
 {
   "name": "orbit",
   "version": "1.0.0",
-  "description": "Orbit \u2014 menu bar meeting alerts with Google Calendar, Elgato lights, and Home Assistant phone push",
+  "description": "Orbit — menu bar meeting alerts with Google Calendar, Elgato lights, and Home Assistant phone push",
   "main": "tray.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
     "tray": "electron tray.js",
     "test-push": "node test-push.js",
-    "dist:mac": "electron-builder --mac",
-    "dist:mac-dir": "electron-builder --mac --dir"
+    "build:camera": "swiftc -O native/camera-monitor.swift -o bin/camera-monitor",
+    "dist:mac": "npm run build:camera && electron-builder --mac",
+    "dist:mac-dir": "npm run build:camera && electron-builder --mac --dir"
   },
   "engines": {
     "node": ">=18"
@@ -22,6 +23,7 @@
     "googleapis": "^126.0.1",
     "moment": "^2.29.4",
     "node-cron": "^3.0.3",
+    "node-notifier": "^10.0.1",
     "open": "^10.1.2"
   },
   "devDependencies": {
@@ -41,6 +43,8 @@
       "assets/icon.png",
       "assets/hud.html",
       "assets/log.html",
+      "assets/alert-panel.html",
+      "assets/alert-history.html",
       "sounds/**/*",
       "node_modules/**/*",
       "package.json",
@@ -56,16 +60,23 @@
       "webhook-server.js",
       "elgato-discover.js",
       "cloudflare-tunnel.js",
-      "orbit-log.js"
+      "orbit-log.js",
+      "desktop-notify.js",
+      "sound-resolver.js"
     ],
     "asarUnpack": [
       "sounds/**/*",
-      "assets/hud.html"
+      "assets/hud.html",
+      "node_modules/node-notifier/vendor/**"
     ],
     "extraResources": [
       {
         "from": ".env.example",
         "to": ".env.example"
+      },
+      {
+        "from": "bin/camera-monitor",
+        "to": "camera-monitor"
       }
     ],
     "mac": {

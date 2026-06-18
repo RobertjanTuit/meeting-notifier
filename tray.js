@@ -8,8 +8,13 @@ const {
     clearHaPhoneAlert,
     isHaDismissRequested,
     acknowledgeHaDismiss,
+    isHaPushEnabled,
+    setHaPushEnabled,
+    subscribeHaStates,
+    stopHaSpokenAlert,
     isConfigured: haPushConfigured,
     dismissEntityId,
+    pushEntityId,
 } = require('./push.js');
 const { fixAudio } = require('./audio-fix.js');
 const { createConfigStore } = require('./config-store.js');
@@ -23,6 +28,8 @@ const {
     checkPublicTunnelHealth,
 } = require('./cloudflare-tunnel.js');
 const log = require('./orbit-log.js');
+const { showDesktopNotification: postDesktopNotification } = require('./desktop-notify.js');
+const { createSoundResolver } = require('./sound-resolver.js');
 
 let tray = null;
 let notifier = null;
@@ -47,6 +54,7 @@ let settingsHandlersRegistered = false;
 const TUNNEL_HEALTH_INTERVAL_MS = Number(process.env.ORBIT_TUNNEL_HEALTH_INTERVAL_MS) || 5 * 60 * 1000;
 const TUNNEL_HEALTH_INITIAL_DELAY_MS = Number(process.env.ORBIT_TUNNEL_HEALTH_INITIAL_DELAY_MS) || 30 * 1000;
 let hudWindow = null;
+let alertPanelWindow = null;
 let isQuitting = false;
 let menuIsOpen = false;
 let pendingMenuRebuild = false;
@@ -55,9 +63,28 @@ let lastDockBadge = null;
 let lastMenuSignature = null;
 let dockShown = false;
 let hudUserPosition = null;
+let alertPanelUserPosition = null;
+let suppressPanelMoveSave = false;
+/** Camera whose active streaming marks you as "in a call" ('' = disabled). */
+let callCameraName = '';
+/** Which signals are allowed to mark you "in a call" (drive lights/status). */
+let callDetectZoom = true;
+let callDetectWeb = true;
+let callDetectCamera = true;
 let cachedAppMenu = null;
 let lastTrayIconKey = null;
 let lastConnectionIssuesKey = null;
+/** @type {{ id: number, title: string, message: string, url?: string, source: string, at: number }[]} */
+const activeAlerts = [];
+const MAX_ACTIVE_ALERTS = 8;
+let alertIdSeq = 0;
+let alertPanelHandlersRegistered = false;
+let defaultAlertSoundPath = null;
+/** Persistent log of every alert (active + dismissed) for the history view. */
+let alertHistory = [];
+let alertHistoryPath = null;
+let historyWindow = null;
+const MAX_ALERT_HISTORY = 1000;
 let sawLaunchNotification = false;
 const logBuffer = [];
 
@@ -83,6 +110,10 @@ let dismissEntityMissing = false;
 // Phone push: away detection + persisted toggle.
 let screenLocked = false;
 let pushEnabled = true;
+/** Latest known state of the HA phone-push helper: true=on, false=off, null=unknown/unconfigured */
+let phonePushState = null;
+let phonePushPollTimer = null;
+let phonePushSubscription = null;
 let menuBarTitle = false;
 /** 'text' = ● in menu bar (most visible); 'dot' = tiny icon; 'ring' = colorful ring */
 let trayIconStyle = 'text';
@@ -103,7 +134,14 @@ function loadSettings(dataDir) {
         if (Number.isFinite(raw.hudX) && Number.isFinite(raw.hudY)) {
             hudUserPosition = { x: raw.hudX, y: raw.hudY };
         }
+        if (Number.isFinite(raw.alertPanelX) && Number.isFinite(raw.alertPanelY)) {
+            alertPanelUserPosition = { x: raw.alertPanelX, y: raw.alertPanelY };
+        }
         if (raw.sawLaunchNotification === true) sawLaunchNotification = true;
+        if (typeof raw.callCameraName === 'string') callCameraName = raw.callCameraName;
+        if (typeof raw.callDetectZoom === 'boolean') callDetectZoom = raw.callDetectZoom;
+        if (typeof raw.callDetectWeb === 'boolean') callDetectWeb = raw.callDetectWeb;
+        if (typeof raw.callDetectCamera === 'boolean') callDetectCamera = raw.callDetectCamera;
     } catch {
         // first run — defaults apply
     }
@@ -116,6 +154,10 @@ function getUiSettings() {
         showFloatingHud,
         pushEnabled,
         pushAvailable: haPushConfigured(),
+        callCameraName,
+        callDetectZoom,
+        callDetectWeb,
+        callDetectCamera,
         launchAtLogin: app.getLoginItemSettings().openAtLogin,
     };
 }
@@ -127,6 +169,20 @@ function applyUiSettings(patch = {}) {
     }
     if (patch.showFloatingHud != null) showFloatingHud = Boolean(patch.showFloatingHud);
     if (patch.pushEnabled != null) pushEnabled = Boolean(patch.pushEnabled);
+    if (patch.callCameraName != null) {
+        callCameraName = String(patch.callCameraName);
+        lastCameraCheck = 0; // re-check immediately with the new selection
+    }
+    if (patch.callDetectZoom != null) callDetectZoom = Boolean(patch.callDetectZoom);
+    if (patch.callDetectWeb != null) {
+        callDetectWeb = Boolean(patch.callDetectWeb);
+        lastWebCallCheck = 0;
+    }
+    if (patch.callDetectCamera != null) {
+        callDetectCamera = Boolean(patch.callDetectCamera);
+        lastCameraCheck = 0;
+    }
+    if (notifier) notifier.zoomProcessDetectionEnabled = callDetectZoom;
     if (patch.launchAtLogin != null) {
         app.setLoginItemSettings({
             openAtLogin: Boolean(patch.launchAtLogin),
@@ -147,10 +203,15 @@ function saveSettings() {
     try {
         const data = {
             pushEnabled, menuBarTitle, trayIconStyle, showFloatingHud, sawLaunchNotification,
+            callCameraName, callDetectZoom, callDetectWeb, callDetectCamera,
         };
         if (hudUserPosition) {
             data.hudX = hudUserPosition.x;
             data.hudY = hudUserPosition.y;
+        }
+        if (alertPanelUserPosition) {
+            data.alertPanelX = alertPanelUserPosition.x;
+            data.alertPanelY = alertPanelUserPosition.y;
         }
         fs.writeFileSync(settingsPath, JSON.stringify(data, null, 2));
     } catch (err) {
@@ -178,6 +239,88 @@ function shouldPushForMeeting(meeting) {
     if (!meeting) return true;
     const cfg = notifier?.getCalendarConfig?.(meeting._calendarId);
     return cfg?.push !== false;
+}
+
+/** Human label for the phone-push indicator shown in the menu bar / HUD. */
+function phonePushStatusLabel() {
+    if (!haPushConfigured()) return 'Phone alerts: not configured';
+    if (phonePushState === false) return 'Phone alerts: Off (from phone)';
+    if (phonePushState === true) return 'Phone alerts: On';
+    return 'Phone alerts: checking…';
+}
+
+/** Compact always-visible menu-bar glyph for phone-push state ('' when unconfigured). */
+function phonePushGlyph() {
+    if (!haPushConfigured()) return '';
+    if (phonePushState === false) return '🔕';
+    if (phonePushState === true) return '🔔';
+    return '';
+}
+
+/** Apply a freshly observed phone-push state and refresh the menu/HUD if changed. */
+function applyPhonePushState(next) {
+    if (next === phonePushState) return;
+    phonePushState = next;
+    lastMenuSignature = null;
+    lastTrayTitle = null;
+    updateTrayTitle();
+    if (trayPaths) buildMenu(trayPaths);
+    updateHudWindow();
+}
+
+/** Poll the HA helper so the menu/HUD reflect the phone-side toggle. */
+async function refreshPhonePushState() {
+    let next = null;
+    if (haPushConfigured()) {
+        try { next = await isHaPushEnabled(); } catch { next = null; }
+    }
+    applyPhonePushState(next);
+}
+
+function startPhonePushPolling() {
+    if (phonePushPollTimer) return;
+    refreshPhonePushState().catch(() => {});
+    // Poll as a fallback; the websocket below gives instant updates when connected.
+    phonePushPollTimer = setInterval(() => {
+        refreshPhonePushState().catch(() => {});
+    }, 60 * 1000);
+}
+
+/** Phone "dismiss" toggle flipped on → silence the spoken alert + clear any Mac alert. */
+async function handlePhoneDismiss() {
+    console.log('📱 Dismiss toggle on — silencing phone spoken alert');
+    await stopHaSpokenAlert();
+    if (alert.active) stopAlert('phone');
+    await acknowledgeHaDismiss();
+}
+
+/** Live updates from HA over websocket so toggles reflect immediately. */
+function startPhonePushSubscription() {
+    if (phonePushSubscription || !haPushConfigured()) return;
+    const pushId = pushEntityId();
+    const dismissId = dismissEntityId();
+    phonePushSubscription = subscribeHaStates([pushId, dismissId], (entityId, state) => {
+        if (entityId === pushId) {
+            applyPhonePushState(state !== 'off');
+        } else if (entityId === dismissId && state === 'on') {
+            handlePhoneDismiss().catch((err) => console.error('Phone dismiss:', err.message));
+        }
+    });
+}
+
+/** Flip the phone-push helper from the Mac and refresh the indicator. */
+async function togglePhonePush() {
+    if (!haPushConfigured()) return;
+    const target = !(phonePushState === true);
+    const ok = await setHaPushEnabled(target);
+    if (ok) {
+        phonePushState = target;
+        lastMenuSignature = null;
+        if (trayPaths) buildMenu(trayPaths);
+        updateHudWindow();
+    } else {
+        console.error('📱 Could not change phone push state in Home Assistant');
+    }
 }
 
 /** True when you've already joined (Zoom active or meeting URL open in a browser). */
@@ -280,6 +423,68 @@ async function isMeetingOpenInBrowser(meetingUrl) {
     return urls.some((u) => normalizeUrl(u).includes(target));
 }
 
+// URLs that indicate an active browser-based video call. Meet uses a 3-4-3
+// letter code in the path (lobby/landing pages have no code); Daily rooms live
+// at <team>.daily.co/<room>; Zoom's web client at app.zoom.us/wc.
+const WEB_CALL_URL_RE = /(meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3})|([a-z0-9-]+\.daily\.co\/[^/\s?#]+)|(daily\.co\/[^/\s?#]+)|(zoom\.us\/wc\/)|(whereby\.com\/[^/\s?#]+)/i;
+let webCallState = false;
+let lastWebCallCheck = 0;
+
+/** Throttled detector: are we in a browser-based call (Meet/Daily/Zoom-web)? */
+async function detectWebCall() {
+    if (!callDetectWeb) return false;
+    const now = Date.now();
+    if (now - lastWebCallCheck < 5000) return webCallState ? 'Browser tab' : false;
+    lastWebCallCheck = now;
+    try {
+        const urls = await getOpenBrowserUrls();
+        webCallState = urls.some((u) => WEB_CALL_URL_RE.test(u));
+    } catch {
+        // keep previous state on failure
+    }
+    return webCallState ? 'Browser tab' : false;
+}
+
+function cameraMonitorPath() {
+    return app.isPackaged
+        ? path.join(process.resourcesPath, 'camera-monitor')
+        : path.join(__dirname, 'bin', 'camera-monitor');
+}
+
+/** Run the native CoreMediaIO helper → [{ name, running }]. Empty on failure. */
+function listCameraStates() {
+    return new Promise((resolve) => {
+        const bin = cameraMonitorPath();
+        require('child_process').execFile(bin, { timeout: 4000 }, (err, stdout) => {
+            if (err || !stdout) return resolve([]);
+            const rows = stdout.split('\n').map((line) => {
+                const tab = line.indexOf('\t');
+                if (tab < 0) return null;
+                return { running: line.slice(0, tab).trim() === '1', name: line.slice(tab + 1).trim() };
+            }).filter((r) => r && r.name);
+            resolve(rows);
+        });
+    });
+}
+
+let callCameraState = false;
+let lastCameraCheck = 0;
+
+/** Throttled detector: is the user-selected meeting camera actively streaming? */
+async function detectSelectedCamera() {
+    if (!callDetectCamera || !callCameraName) return false;
+    const now = Date.now();
+    if (now - lastCameraCheck < 4000) return callCameraState ? `Camera: ${callCameraName}` : false;
+    lastCameraCheck = now;
+    try {
+        const cams = await listCameraStates();
+        callCameraState = cams.some((c) => c.name === callCameraName && c.running);
+    } catch {
+        // keep previous state on failure
+    }
+    return callCameraState ? `Camera: ${callCameraName}` : false;
+}
+
 // Mirror all console output into an in-app buffer (and the console window, if
 // open) so the app can be run from the Dock without a terminal and still show
 // its logs. The original terminal output is preserved.
@@ -331,6 +536,33 @@ function createLogWindow() {
         }
     });
     return logWindow;
+}
+
+
+function createAlertHistoryWindow() {
+    if (historyWindow && !historyWindow.isDestroyed()) {
+        if (historyWindow.isMinimized()) historyWindow.restore();
+        historyWindow.show();
+        historyWindow.focus();
+        sendHistoryUpdate();
+        return historyWindow;
+    }
+    historyWindow = new BrowserWindow({
+        width: 760,
+        height: 560,
+        title: 'Orbit — Alert History',
+        backgroundColor: '#1e1e1e',
+        webPreferences: { nodeIntegration: true, contextIsolation: false },
+    });
+    historyWindow.loadFile(path.join(__dirname, 'assets', 'alert-history.html'));
+    historyWindow.webContents.on('did-finish-load', () => sendHistoryUpdate());
+    historyWindow.on('close', (e) => {
+        if (!isQuitting) {
+            e.preventDefault();
+            historyWindow.hide();
+        }
+    });
+    return historyWindow;
 }
 
 
@@ -673,12 +905,12 @@ function applyTunnelHealthResult(result, { notify = true } = {}) {
 
     if (tunnelHealth.ok === false && lastTunnelHealthNotifyOk !== false) {
         lastTunnelHealthNotifyOk = false;
-        if (Notification.isSupported()) {
-            new Notification({
-                title: 'Orbit — Tunnel unreachable',
-                body: tunnelHealth.error || 'Public health check failed',
-            }).show();
-        }
+        showUserAlert({
+            title: 'Orbit — Tunnel unreachable',
+            body: tunnelHealth.error || 'Public health check failed',
+            source: 'tunnel',
+            record: true,
+        });
         log.tunnelWarn(`Public health check failed: ${tunnelHealth.error}`);
     } else if (tunnelHealth.ok === true && lastTunnelHealthNotifyOk === false) {
         lastTunnelHealthNotifyOk = true;
@@ -831,9 +1063,322 @@ async function setupCalendarPush() {
     });
 }
 
+function resolveAlertSoundPath(defaultPath) {
+    const custom = process.env.ALERT_SOUND?.trim();
+    if (custom) {
+        if (fs.existsSync(custom)) return custom;
+        console.warn(`Alert sound not found: ${custom} — using default`);
+    }
+    return defaultPath;
+}
+
+function desktopNotificationsEnabled() {
+    try {
+        const alerts = configStore?.getSection('alerts');
+        return alerts?.desktopNotifications === true;
+    } catch {
+        return false;
+    }
+}
+
+function floatingAlertBannerEnabled() {
+    try {
+        const alerts = configStore?.getSection('alerts');
+        return alerts?.floatingAlertBanner !== false;
+    } catch {
+        return true;
+    }
+}
+
+function openAlertTarget(url, body) {
+    if (url) shell.openExternal(url);
+    else if (body) clipboard.writeText(body);
+}
+
+function dismissAlert(id) {
+    const idx = activeAlerts.findIndex((a) => a.id === id);
+    if (idx >= 0) activeAlerts.splice(idx, 1);
+    markHistoryDismissed([id]);
+    updateAlertPanel();
+    lastMenuSignature = null;
+    if (trayPaths) refreshUI(trayPaths);
+}
+
+function dismissAllAlerts() {
+    if (!activeAlerts.length) return;
+    markHistoryDismissed(activeAlerts.map((a) => a.id));
+    activeAlerts.length = 0;
+    updateAlertPanel();
+    lastMenuSignature = null;
+    if (trayPaths) refreshUI(trayPaths);
+}
+
+function loadAlertHistory(dataDir) {
+    alertHistoryPath = path.join(dataDir, 'alert-history.json');
+    try {
+        const raw = JSON.parse(fs.readFileSync(alertHistoryPath, 'utf8'));
+        if (Array.isArray(raw)) alertHistory = raw;
+    } catch {
+        alertHistory = [];
+    }
+}
+
+function saveAlertHistory() {
+    if (!alertHistoryPath) return;
+    try {
+        fs.writeFileSync(alertHistoryPath, JSON.stringify(alertHistory.slice(0, MAX_ALERT_HISTORY), null, 2));
+    } catch (err) {
+        console.error('Failed to save alert history:', err.message);
+    }
+}
+
+function recordAlertHistory(item, { urgent = false, groupKey } = {}) {
+    const today = new Date().toDateString();
+    if (groupKey) {
+        const existing = alertHistory.find(
+            (h) => h.groupKey === groupKey && new Date(h.at).toDateString() === today,
+        );
+        if (existing) {
+            existing.title = item.title;
+            existing.message = item.message;
+            existing.url = item.url;
+            existing.source = item.source;
+            existing.urgent = existing.urgent || Boolean(urgent);
+            existing.count = (existing.count || 1) + 1;
+            existing.at = item.at;
+            existing.dismissedAt = null;
+            const idx = alertHistory.indexOf(existing);
+            if (idx > 0) {
+                alertHistory.splice(idx, 1);
+                alertHistory.unshift(existing);
+            }
+            saveAlertHistory();
+            sendHistoryUpdate();
+            return;
+        }
+    }
+    alertHistory.unshift({
+        id: item.id,
+        title: item.title,
+        message: item.message,
+        url: item.url,
+        source: item.source,
+        groupKey: groupKey || null,
+        count: 1,
+        urgent: Boolean(urgent),
+        at: item.at,
+        dismissedAt: null,
+    });
+    if (alertHistory.length > MAX_ALERT_HISTORY) alertHistory.length = MAX_ALERT_HISTORY;
+    saveAlertHistory();
+    sendHistoryUpdate();
+}
+
+function markHistoryDismissed(ids) {
+    const set = new Set(ids);
+    let changed = false;
+    const now = Date.now();
+    for (const h of alertHistory) {
+        if (set.has(h.id) && !h.dismissedAt) {
+            h.dismissedAt = now;
+            changed = true;
+        }
+    }
+    if (changed) {
+        saveAlertHistory();
+        sendHistoryUpdate();
+    }
+}
+
+function sendHistoryUpdate() {
+    if (historyWindow && !historyWindow.isDestroyed()) {
+        historyWindow.webContents.send('alert-history:update', alertHistory);
+    }
+}
+
+function pushAlert({ title, message, url, source, urgent, groupKey }) {
+    // Merge alerts that share a group (e.g. all reminders for one meeting) into a
+    // single, updating entry with a count instead of stacking duplicates.
+    if (groupKey) {
+        const existing = activeAlerts.find((a) => a.groupKey === groupKey);
+        if (existing) {
+            existing.title = title || existing.title;
+            existing.message = message || existing.message;
+            existing.url = url || existing.url;
+            existing.source = source || existing.source;
+            existing.at = Date.now();
+            existing.count = (existing.count || 1) + 1;
+            const idx = activeAlerts.indexOf(existing);
+            if (idx > 0) {
+                activeAlerts.splice(idx, 1);
+                activeAlerts.unshift(existing);
+            }
+            recordAlertHistory(existing, { urgent, groupKey });
+            updateAlertPanel();
+            lastMenuSignature = null;
+            if (trayPaths) refreshUI(trayPaths);
+            return existing;
+        }
+    }
+
+    const item = {
+        id: ++alertIdSeq,
+        title: title || 'Orbit',
+        message: message || '',
+        url: url || '',
+        source: source || 'orbit',
+        groupKey: groupKey || null,
+        count: 1,
+        at: Date.now(),
+    };
+    activeAlerts.unshift(item);
+    if (activeAlerts.length > MAX_ACTIVE_ALERTS) activeAlerts.length = MAX_ACTIVE_ALERTS;
+    recordAlertHistory(item, { urgent, groupKey });
+    updateAlertPanel();
+    lastMenuSignature = null;
+    if (trayPaths) refreshUI(trayPaths);
+    return item;
+}
+
+function setPanelPosition(x, y) {
+    // Wrap programmatic moves so the 'moved' handler doesn't mistake them for the
+    // user dragging the panel (which would overwrite their saved position).
+    suppressPanelMoveSave = true;
+    alertPanelWindow.setPosition(Math.round(x), Math.round(y));
+    setTimeout(() => { suppressPanelMoveSave = false; }, 60);
+}
+
+function positionAlertPanelWindow() {
+    if (!alertPanelWindow || alertPanelWindow.isDestroyed()) return;
+    const { workArea } = getOverlayDisplay();
+    const [w] = alertPanelWindow.getSize();
+
+    // Respect a user-dragged position; only keep it on-screen.
+    if (alertPanelUserPosition) {
+        const x = Math.min(
+            Math.max(alertPanelUserPosition.x, workArea.x),
+            workArea.x + workArea.width - w,
+        );
+        const y = Math.min(
+            Math.max(alertPanelUserPosition.y, workArea.y),
+            workArea.y + workArea.height - 40,
+        );
+        setPanelPosition(x, y);
+        return;
+    }
+
+    let x = workArea.x + workArea.width - w - 14;
+    let y = workArea.y + 40;
+    if (hudWindow && !hudWindow.isDestroyed() && hudWindow.isVisible()) {
+        const [hx, hy] = hudWindow.getPosition();
+        const [, hh] = hudWindow.getSize();
+        x = Math.min(hx, workArea.x + workArea.width - w - 14);
+        y = hy + hh + 6;
+    }
+    setPanelPosition(x, y);
+}
+
+function createAlertPanelWindow() {
+    if (!floatingAlertBannerEnabled()) return;
+    if (alertPanelWindow && !alertPanelWindow.isDestroyed()) return;
+
+    alertPanelWindow = new BrowserWindow({
+        width: 360,
+        height: 120,
+        frame: false,
+        transparent: true,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        resizable: false,
+        focusable: true,
+        hasShadow: false,
+        fullscreenable: false,
+        show: false,
+        ...(process.platform === 'darwin' ? { type: 'panel' } : {}),
+        webPreferences: { nodeIntegration: true, contextIsolation: false },
+    });
+    applyFloatingOverlayBehavior(alertPanelWindow);
+    alertPanelWindow.loadFile(path.join(__dirname, 'assets', 'alert-panel.html'));
+    alertPanelWindow.webContents.on('did-finish-load', () => updateAlertPanel());
+    alertPanelWindow.on('moved', () => {
+        if (suppressPanelMoveSave || !alertPanelWindow || alertPanelWindow.isDestroyed()) return;
+        const [x, y] = alertPanelWindow.getPosition();
+        alertPanelUserPosition = { x, y };
+        saveSettings();
+    });
+    alertPanelWindow.on('closed', () => {
+        alertPanelWindow = null;
+    });
+}
+
+function updateAlertPanel() {
+    if (!floatingAlertBannerEnabled()) {
+        if (alertPanelWindow && !alertPanelWindow.isDestroyed()) alertPanelWindow.hide();
+        return;
+    }
+    createAlertPanelWindow();
+    if (!alertPanelWindow || alertPanelWindow.isDestroyed()) return;
+
+    if (!activeAlerts.length) {
+        alertPanelWindow.hide();
+        return;
+    }
+
+    applyFloatingOverlayBehavior(alertPanelWindow);
+    alertPanelWindow.webContents.send('alert-panel:update', activeAlerts);
+    positionAlertPanelWindow();
+    if (!alertPanelWindow.isVisible()) alertPanelWindow.showInactive();
+}
+
+function registerAlertPanelHandlers() {
+    if (alertPanelHandlersRegistered) return;
+    alertPanelHandlersRegistered = true;
+
+    ipcMain.on('alert-panel:dismiss', (_e, id) => dismissAlert(Number(id)));
+    ipcMain.on('alert-panel:dismiss-all', () => dismissAllAlerts());
+    ipcMain.on('alert-panel:open', (_e, id) => {
+        const item = activeAlerts.find((a) => a.id === Number(id));
+        if (item) openAlertTarget(item.url, item.message);
+    });
+    ipcMain.on('alert-panel:resize', (_e, width, height) => {
+        if (!alertPanelWindow || alertPanelWindow.isDestroyed()) return;
+        alertPanelWindow.setSize(Math.round(width), Math.round(height));
+        positionAlertPanelWindow();
+    });
+    ipcMain.handle('alert-panel:get', () => activeAlerts);
+
+    ipcMain.handle('cameras:list', () => listCameraStates());
+
+    ipcMain.handle('alert-history:get', () => alertHistory);
+    ipcMain.on('alert-history:open-item', (_e, url, message) => openAlertTarget(url, message));
+    ipcMain.on('alert-history:clear', () => {
+        alertHistory = [];
+        saveAlertHistory();
+        sendHistoryUpdate();
+    });
+}
+
+function showUserAlert({ title, body, url, source, urgent = false, groupKey, record = true, forceSystem = false }) {
+    if (record) pushAlert({ title, message: body, url, source, urgent, groupKey });
+    else updateAlertPanel();
+
+    if (!forceSystem && !desktopNotificationsEnabled()) return;
+
+    postDesktopNotification({
+        title: title || 'Orbit',
+        body: body || '',
+        subtitle: source && source !== 'test' ? String(source) : '',
+        open: url || undefined,
+        onClick: url ? undefined : () => openAlertTarget(url, body),
+    }).catch((err) => {
+        log.orbitError(`System notification failed: ${err.message}`);
+    });
+}
+
 function applySettingsRestart(flags) {
     if (!flags || !notifier) return;
     if (flags.lights && notifier.reinitializeLights) notifier.reinitializeLights();
+    if (flags.sound && notifier.reinitializeSound) notifier.reinitializeSound();
     if (flags.calendar) {
         if (notifier.restartMeetingPoll) notifier.restartMeetingPoll();
         if (notifier.reloadCalendarAuth) notifier.reloadCalendarAuth();
@@ -903,6 +1448,7 @@ function registerSettingsHandlers() {
             configStore.reloadIntoProcess();
             applySettingsRestart(restart);
             if (section === 'clickup') restartClickUpWatcher();
+            if (section === 'alerts') updateAlertPanel();
             if (section === 'tunnel' && !restart.tunnel) {
                 runTunnelHealthCheck({ notify: true }).catch((err) => {
                     log.tunnelError(`Health check after save: ${err.message}`);
@@ -917,6 +1463,17 @@ function registerSettingsHandlers() {
     ipcMain.handle('settings:list-calendars', async () => {
         if (!notifier?.listCalendars) return [];
         return notifier.listCalendars();
+    });
+
+    ipcMain.handle('settings:pick-sound-file', async () => {
+        const win = settingsWindow && !settingsWindow.isDestroyed() ? settingsWindow : null;
+        const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+            title: 'Choose alert sound',
+            filters: [{ name: 'Audio', extensions: ['wav', 'mp3', 'aiff', 'aif', 'm4a', 'caf', 'aac'] }],
+            properties: ['openFile'],
+        });
+        if (canceled || !filePaths?.[0]) return { ok: false };
+        return { ok: true, path: filePaths[0] };
     });
 
     ipcMain.handle('settings:clickup-browse', async (_e, { kind, search, page, credentials } = {}) => {
@@ -959,13 +1516,28 @@ function registerSettingsHandlers() {
                 const lights = await notifier.discoverElgatoLights({ timeoutMs: params?.timeoutMs || 4000 });
                 return { ok: true, lights };
             }
-            if (kind === 'push-gentle') {
-                await sendHaPush({ title: 'Orbit test', message: 'Gentle push from Settings', urgent: false });
+            if (kind === 'alert-sound') {
+                if (!notifier?.playAlertSound) return { ok: false, error: 'Sound not available' };
+                await notifier.playAlertSound(params?.source || 'meetings');
                 return { ok: true };
             }
-            if (kind === 'push-urgent') {
-                await sendHaPush({ title: 'Orbit test', message: 'Urgent push from Settings', urgent: true });
+            if (kind === 'desktop-notification') {
+                showUserAlert({
+                    title: 'Orbit test alert',
+                    body: 'Floating banner test — dismiss with × or open from the list.',
+                    source: 'test',
+                });
                 return { ok: true };
+            }
+            if (kind === 'push-gentle' || kind === 'push-urgent') {
+                const urgent = kind === 'push-urgent';
+                const enabled = await isHaPushEnabled();
+                const sent = await sendHaPush({
+                    title: 'Orbit test',
+                    message: `${urgent ? 'Urgent' : 'Gentle'} push from Settings`,
+                    urgent,
+                });
+                return { ok: true, sent, disabled: !enabled };
             }
             if (kind === 'clickup-connection') {
                 if (!clickUpWatcher) return { ok: false, error: 'ClickUp watcher not initialized' };
@@ -1127,6 +1699,33 @@ function destroyFlashWindows() {
     flashWindows = null;
 }
 
+/** Display the user is most likely looking at (cursor / active fullscreen). */
+function getOverlayDisplay() {
+    try {
+        return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    } catch {
+        return screen.getPrimaryDisplay();
+    }
+}
+
+/**
+ * macOS fullscreen apps use a separate space — windows need screen-saver level
+ * and fullscreenable:false (NSWindowCollectionBehaviorFullScreenAuxiliary).
+ */
+function applyFloatingOverlayBehavior(win) {
+    if (!win || win.isDestroyed()) return;
+    if (process.platform === 'darwin') {
+        win.setFullScreenable(false);
+        win.setVisibleOnAllWorkspaces(true, {
+            visibleOnFullScreen: true,
+            skipTransformProcessType: true,
+        });
+        win.setAlwaysOnTop(true, 'screen-saver', 1);
+    } else {
+        win.setAlwaysOnTop(true, 'floating');
+    }
+}
+
 // Create one borderless, click-through, always-on-top white window per display.
 // Reused across flashes; rebuilt if the monitor layout changes.
 function ensureFlashWindows() {
@@ -1260,12 +1859,16 @@ function resolvePaths() {
     }
     console.log(`📂 Config dir: ${configDir}`);
 
+    defaultAlertSoundPath = soundPath;
+    const soundsDir = path.dirname(soundPath);
+
     return {
         userData: configDir,
         envCandidates: [path.join(configDir, '.env')],
         credentialsPath: path.join(configDir, 'credentials.json'),
         dataDir: configDir,
-        soundPath,
+        soundsDir,
+        soundPath: resolveAlertSoundPath(soundPath),
     };
 }
 
@@ -1505,19 +2108,20 @@ function recreateTray() {
 }
 
 function hudLabelText() {
+    const muted = phonePushState === false ? '🔕 ' : '';
     if (alert.active) {
-        return `🔴 ${truncate(alert.meeting?.summary || 'Meeting', 18)}`;
+        return `${muted}🔴 ${truncate(alert.meeting?.summary || 'Meeting', 18)}`;
     }
     const meeting = notifier?.nextMeeting;
-    if (!meeting) return 'No meetings';
+    if (!meeting) return `${muted}No meetings`;
     const desc = describeNextMeeting(meeting);
-    if (!desc) return 'No meetings';
-    return `${truncate(desc.summary, 16)}  ${formatCountdown(desc.msUntil)}`;
+    if (!desc) return `${muted}No meetings`;
+    return `${muted}${truncate(desc.summary, 16)}  ${formatCountdown(desc.msUntil)}`;
 }
 
 function positionHudWindowDefault() {
     if (!hudWindow || hudWindow.isDestroyed()) return;
-    const { workArea } = screen.getPrimaryDisplay();
+    const { workArea } = getOverlayDisplay();
     const [w] = hudWindow.getSize();
     hudWindow.setPosition(workArea.x + workArea.width - w - 14, workArea.y + 4);
 }
@@ -1545,11 +2149,12 @@ function createHudWindow() {
         resizable: false,
         focusable: false,
         hasShadow: true,
+        fullscreenable: false,
         show: false,
+        ...(process.platform === 'darwin' ? { type: 'panel' } : {}),
         webPreferences: { contextIsolation: true, nodeIntegration: false },
     });
-    hudWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-    hudWindow.setAlwaysOnTop(true, 'floating', 1);
+    applyFloatingOverlayBehavior(hudWindow);
     hudWindow.loadFile(path.join(__dirname, 'assets', 'hud.html'));
     hudWindow.webContents.on('context-menu', (e, params) => {
         e.preventDefault();
@@ -1560,6 +2165,7 @@ function createHudWindow() {
         const [x, y] = hudWindow.getPosition();
         hudUserPosition = { x, y };
         saveSettings();
+        if (activeAlerts.length) positionAlertPanelWindow();
     });
     hudWindow.webContents.on('did-finish-load', () => updateHudWindow());
     screen.on('display-metrics-changed', () => {
@@ -1600,10 +2206,12 @@ function updateHudWindow() {
         } else if (!hudWindow.isVisible()) {
             positionHudWindowDefault();
         }
+        applyFloatingOverlayBehavior(hudWindow);
         if (!hudWindow.isVisible()) hudWindow.showInactive();
     }).catch(() => {
         if (!hudWindow.isDestroyed() && !hudWindow.isVisible()) {
             positionHudWindow();
+            applyFloatingOverlayBehavior(hudWindow);
             hudWindow.showInactive();
         }
     });
@@ -1870,6 +2478,13 @@ function updateTrayTitle() {
             }
         }
 
+        // Always-visible phone-push indicator, even when the meeting title is hidden.
+        const ppGlyph = phonePushGlyph();
+        if (ppGlyph) {
+            title = title ? `${ppGlyph}${title}` : ` ${ppGlyph}`;
+            tooltip = `${tooltip} · Phone alerts ${phonePushState === false ? 'OFF' : 'ON'}`;
+        }
+
         setTrayTitleIfChanged(title);
         tray.setToolTip(tooltip);
         updateTrayIcon();
@@ -1879,7 +2494,11 @@ function updateTrayTitle() {
 }
 
 function attachMenuLifecycle(menu) {
-    menu.on('menu-will-show', () => { menuIsOpen = true; });
+    menu.on('menu-will-show', () => {
+        menuIsOpen = true;
+        // Pull the freshest phone-push state so a reopened menu reflects HA on demand.
+        refreshPhonePushState().catch(() => {});
+    });
     menu.on('menu-will-close', () => {
         menuIsOpen = false;
         if (pendingMenuRebuild && trayPaths) {
@@ -1900,15 +2519,19 @@ function menuStructureSignature(paths) {
         status: notifier?.status,
         err: notifier?.lastError?.message,
         nextId: next?.id,
+        nextStart: next?.start?.dateTime,
         nextCal: next?._calendarId,
         nextColor: calendarColorForMeeting(next),
         currentId: current?.id,
+        currentStart: current?.start?.dateTime,
         zoom: notifier?.zoomIsRunning,
+        callSource: notifier?.callSource,
         authUrl: !!notifier?.authUrl,
         nextLink: !!next?.videoEntryPoint?.uri,
         currentLink: !!current?.videoEntryPoint?.uri,
         lights: notifier?.keyLights?.length ?? 0,
         haPush: haPushConfigured(),
+        phonePush: phonePushState,
         login: app.getLoginItemSettings().openAtLogin,
         dataDir: paths?.dataDir,
         tunnelHealth: tunnelHealth.ok,
@@ -2045,7 +2668,7 @@ function buildMenu(paths) {
     items.push({ type: 'separator' });
 
     items.push({
-        label: notifier?.zoomIsRunning ? 'Zoom: in meeting' : 'Zoom: idle',
+        label: notifier?.zoomIsRunning ? `In a call · ${notifier?.callSource || 'detected'}` : 'Not in a call',
         enabled: false,
     });
 
@@ -2055,6 +2678,14 @@ function buildMenu(paths) {
         enabled: false,
     });
 
+    items.push({
+        label: `📱 ${phonePushStatusLabel()}`,
+        type: haPushConfigured() ? 'checkbox' : 'normal',
+        checked: phonePushState === true,
+        enabled: haPushConfigured(),
+        click: () => togglePhonePush().catch((err) => console.error('Toggle phone push:', err.message)),
+    });
+
     items.push({ type: 'separator' });
 
     items.push({
@@ -2062,6 +2693,32 @@ function buildMenu(paths) {
         click: () => notifier?.checkForNextMeeting(),
         enabled: notifier?.status === 'running',
     });
+    if (activeAlerts.length) {
+        items.push({ type: 'separator' });
+        items.push({ label: 'Active alerts', enabled: false });
+        items.push({ label: 'Dismiss all alerts', click: () => dismissAllAlerts() });
+        for (const a of activeAlerts) {
+            const age = moment(a.at).fromNow();
+            items.push({
+                label: truncate(`${a.title} — ${a.message} · ${age}`, 58),
+                click: () => {
+                    if (a.url) shell.openExternal(a.url);
+                    else if (a.message) clipboard.writeText(a.message);
+                },
+            });
+        }
+    }
+
+    items.push({
+        label: 'Alert history…',
+        click: () => createAlertHistoryWindow(),
+    });
+    if (haPushConfigured()) {
+        items.push({
+            label: 'Silence phone alarm',
+            click: () => stopHaSpokenAlert().catch((err) => console.error('Silence phone alarm:', err.message)),
+        });
+    }
     items.push({
         label: 'Settings…',
         click: () => createSettingsWindow(),
@@ -2085,6 +2742,24 @@ function buildMenu(paths) {
                 },
             },
             ...buildClickUpTestMenuItems(),
+            {
+                label: 'Test floating alert banner',
+                click: () => {
+                    showUserAlert({
+                        title: 'Orbit test alert',
+                        body: 'This should appear in the floating banner. Click to copy; links open in browser.',
+                        source: 'test',
+                    });
+                },
+            },
+            {
+                label: 'Test ClickUp sound',
+                click: () => notifier?.playAlertSound('clickup'),
+            },
+            {
+                label: 'Test meeting sound',
+                click: () => notifier?.playAlertSound('meetings'),
+            },
             {
                 label: 'Fix Audio',
                 enabled: process.platform === 'darwin',
@@ -2229,6 +2904,7 @@ app.whenReady().then(() => {
     }
     configStore = createConfigStore(paths.dataDir, { extraEnvSources });
     loadSettings(paths.dataDir);
+    loadAlertHistory(paths.dataDir);
     initPresenceTracking();
 
     // Load .env from the user-data location (or project folder in dev) BEFORE
@@ -2250,12 +2926,27 @@ app.whenReady().then(() => {
     }
 
     registerSettingsHandlers();
+    registerAlertPanelHandlers();
 
+    const soundResolver = createSoundResolver({
+        soundsDir: paths.soundsDir,
+        defaultPath: paths.soundPath,
+        getAlertsConfig: () => configStore?.getSection('alerts'),
+    });
     notifier = new OrbitNotifier({
         credentialsPath: paths.credentialsPath,
         dataDir: paths.dataDir,
         soundPath: paths.soundPath,
     });
+    notifier._resolveAlertSound = (source) => soundResolver.resolve(source);
+    notifier.reinitializeSound();
+    // Detect browser-based calls (Google Meet / Daily / Zoom web) in addition to
+    // the native Zoom process, so lights/status reflect those too.
+    notifier.addCallDetector(detectWebCall);
+    // Detect a user-selected meeting camera actively streaming (catches embedded
+    // calls like the ClickUp syncup that have no detectable tab URL).
+    notifier.addCallDetector(detectSelectedCamera);
+    notifier.zoomProcessDetectionEnabled = callDetectZoom;
 
     alertHub = new AlertHub({
         configStore,
@@ -2274,6 +2965,10 @@ app.whenReady().then(() => {
     alertHub.on('clickup-alert', () => {
         lastMenuSignature = null;
         if (trayPaths) refreshUI(trayPaths);
+    });
+
+    alertHub.on('delivered', ({ source, title, message, url, urgent, groupKey }) => {
+        showUserAlert({ title, body: message, url, source, urgent, groupKey });
     });
 
     notifier.on('status', (status) => {
@@ -2314,6 +3009,9 @@ app.whenReady().then(() => {
     refreshUI(paths);
     createHudWindow();
     updateHudWindow();
+    createAlertPanelWindow();
+    startPhonePushPolling();
+    startPhonePushSubscription();
     log.orbit('Started — use menu → Show console window to watch live activity');
 
     if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
@@ -2350,14 +3048,7 @@ app.whenReady().then(() => {
         }, 800);
     }
 
-    if (Notification.isSupported() && !sawLaunchNotification) {
-        const n = new Notification({
-            title: 'Orbit is running',
-            body: 'Menu bar orbit color matches your calendar. Right-click the Dock icon or floating pill for the menu.',
-            silent: true,
-        });
-        n.on('click', () => createLogWindow());
-        n.show();
+    if (!sawLaunchNotification) {
         sawLaunchNotification = true;
         saveSettings();
     }
@@ -2384,6 +3075,10 @@ function cleanup() {
     if (alert.nagTimer) clearInterval(alert.nagTimer);
     if (alert.browserTimer) clearInterval(alert.browserTimer);
     stopDismissPolling();
+    if (phonePushPollTimer) clearInterval(phonePushPollTimer);
+    phonePushPollTimer = null;
+    if (phonePushSubscription) phonePushSubscription.close();
+    phonePushSubscription = null;
     notifier?.stop();
     stopTunnelHealthMonitor();
     stopCloudflareTunnel();
@@ -2400,6 +3095,10 @@ function cleanup() {
     if (hudWindow && !hudWindow.isDestroyed()) {
         hudWindow.destroy();
         hudWindow = null;
+    }
+    if (alertPanelWindow && !alertPanelWindow.isDestroyed()) {
+        alertPanelWindow.destroy();
+        alertPanelWindow = null;
     }
     cachedAppMenu = null;
 }

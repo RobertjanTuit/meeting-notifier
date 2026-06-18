@@ -111,6 +111,8 @@ On first launch, Orbit copies any missing files from the legacy `meeting-notifie
 
 **Dismiss from phone:** See `ha/orbit-dismiss.yaml` — helper `input_boolean.orbit_dismiss`, action `ORBIT_DISMISS`.
 
+**Turn push on/off from phone:** See `ha/orbit-phone-push.yaml` — create toggle helper `input_boolean.orbit_phone_push`. When **off**, the Mac sends no phone push (fails open if the helper doesn't exist). Notifications include a **Pause 1h** action that flips it off and auto re-enables after an hour (`ha/orbit-phone-push-automation.yaml`). Override the entity id with `HA_PUSH_ENTITY` or the Settings → Home Assistant field.
+
 **Per-calendar:** In `calendars.json`, set `"color": "yellow"` or `"color": "red"`. See `calendars.example.json`.
 
 **Test:**

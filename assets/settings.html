@@ -205,6 +205,7 @@
                 <label class="field"><span>Long-lived access token</span><input type="password" id="ha-token" autocomplete="off" /></label>
                 <label class="field"><span>Notify target</span><input type="text" id="ha-notifyTarget" placeholder="notify.mobile_app_pixel" /></label>
                 <label class="field"><span>Dismiss entity</span><input type="text" id="ha-dismissEntity" placeholder="input_boolean.orbit_dismiss" /></label>
+                <label class="field"><span>Phone push toggle entity</span><input type="text" id="ha-pushEntity" placeholder="input_boolean.orbit_phone_push" /></label>
                 <label class="field"><span>Away threshold (seconds)</span><input type="number" id="ha-awayThreshold" min="0" step="1" /></label>
                 <label class="field"><span>Urgent mode</span>
                     <select id="ha-urgentMode">
@@ -305,6 +306,9 @@
                     <label class="field"><span>Quiet hours start</span><input type="text" id="alerts-quietStart" placeholder="22:00" /></label>
                     <label class="field"><span>Quiet hours end</span><input type="text" id="alerts-quietEnd" placeholder="07:00" /></label>
                 </div>
+                <label class="inline"><input type="checkbox" id="alerts-floatingBanner" checked /> Show floating alert banner (recommended)</label>
+                <p class="help">Alerts appear in a small always-on-top panel at the top-right. Click an alert to open its link; × to dismiss.</p>
+                <label class="inline"><input type="checkbox" id="alerts-desktopNotifications" /> Also try macOS Notification Center (unreliable for local builds)</label>
                 <span class="field"><span>Delivery matrix</span></span>
                 <table class="matrix" id="alerts-matrix">
                     <thead>
@@ -323,6 +327,9 @@
                         <tr data-source="datadog"><td>Datadog</td><td><input type="checkbox" data-ch="lights" /></td><td><input type="checkbox" data-ch="sound" /></td><td><input type="checkbox" data-ch="flash" /></td><td><input type="checkbox" data-ch="push" /></td></tr>
                     </tbody>
                 </table>
+                <span class="field"><span>Alert sounds</span></span>
+                <p class="help">Each source has a built-in tone. Override with a custom file path, or leave blank for the default.</p>
+                <div id="alerts-sounds-list"></div>
                 <div class="actions">
                     <button type="button" data-save="alerts">Save</button>
                 </div>
@@ -366,8 +373,27 @@
                 <label class="inline"><input type="checkbox" id="ui-pushEnabled" /> Push to phone when away</label>
                 <p class="help" id="ui-push-help">Requires Home Assistant URL, token, and notify target.</p>
                 <label class="inline"><input type="checkbox" id="ui-launchAtLogin" /> Launch at login</label>
+                <span class="field"><span>In-call detection (what turns the lights on)</span></span>
+                <label class="inline"><input type="checkbox" id="ui-callDetectZoom" /> Zoom app meetings</label>
+                <label class="inline"><input type="checkbox" id="ui-callDetectWeb" /> Browser video calls (Meet / Daily / Zoom web)</label>
+                <label class="inline"><input type="checkbox" id="ui-callDetectCamera" /> Meeting camera in use</label>
+                <label class="field"><span>Meeting camera</span>
+                    <div class="row">
+                        <select id="ui-callCamera"><option value="">None selected</option></select>
+                        <button type="button" class="secondary small" id="ui-callCamera-refresh">Refresh</button>
+                    </div>
+                </label>
+                <p class="help">When any enabled signal is active, Orbit treats you as "in a call" (keeps lights on, shows status). For the camera signal, pick the camera you use for meetings — "(in use)" shows live state.</p>
                 <span class="field"><span>Timezone &amp; audio</span></span>
                 <label class="field"><span>Timezone</span><input type="text" id="general-timezone" placeholder="America/Los_Angeles" /></label>
+                <label class="field"><span>Alert sound</span>
+                    <div class="row">
+                        <input type="text" id="general-alertSound" placeholder="Default ding (sounds/ding.wav)" />
+                        <button type="button" class="secondary small" id="general-alertSound-browse">Browse…</button>
+                        <button type="button" class="secondary small" id="general-alertSound-test">Test</button>
+                    </div>
+                </label>
+                <p class="help">WAV, MP3, or AIFF file played on alert pulses. Leave blank for the built-in ding.</p>
                 <label class="field"><span>Audio output device</span><input type="text" id="general-audioOutput" placeholder="BlackHole 2ch" /></label>
                 <label class="field"><span>Audio input device</span><input type="text" id="general-audioInput" placeholder="Elgato Wave Link Chat Mix" /></label>
                 <div class="actions">
@@ -408,6 +434,12 @@
         const statusEl = document.getElementById('statusbar');
         const SOURCE_KEYS = ['meetings', 'clickup', 'email', 'datadog'];
         const CHANNEL_KEYS = ['lights', 'sound', 'flash', 'push'];
+        const SOUND_SOURCE_LABELS = {
+            meetings: 'Meetings',
+            clickup: 'ClickUp',
+            email: 'Email',
+            datadog: 'Datadog',
+        };
 
         function setStatus(text, kind) {
             statusEl.textContent = text;
@@ -703,6 +735,7 @@
                 ),
                 notifyTarget: document.getElementById('ha-notifyTarget').value.trim(),
                 dismissEntity: document.getElementById('ha-dismissEntity').value.trim(),
+                pushEntity: document.getElementById('ha-pushEntity').value.trim(),
                 awayThresholdSeconds: document.getElementById('ha-awayThreshold').value.trim(),
                 urgentMode: document.getElementById('ha-urgentMode').value,
             };
@@ -851,6 +884,38 @@
             };
         }
 
+        function renderAlertSounds(sounds = {}) {
+            const root = document.getElementById('alerts-sounds-list');
+            if (!root) return;
+            root.innerHTML = SOURCE_KEYS.map((key) => {
+                const val = sounds[key] || '';
+                const label = SOUND_SOURCE_LABELS[key] || key;
+                return (
+                    `<div class="row" data-sound-source="${key}" style="margin-bottom:8px">` +
+                    `<span style="width:72px;flex-shrink:0;font-size:12px;color:#aaa">${label}</span>` +
+                    `<input type="text" class="alert-sound-path" value="${escapeHtml(val)}" placeholder="Built-in ${key}.wav" style="flex:1" />` +
+                    `<button type="button" class="secondary small alert-sound-test">Test</button></div>`
+                );
+            }).join('');
+            root.querySelectorAll('.alert-sound-test').forEach((btn) => {
+                btn.addEventListener('click', async () => {
+                    const row = btn.closest('[data-sound-source]');
+                    const source = row?.dataset?.soundSource;
+                    if (!source) return;
+                    setStatus(`Playing ${SOUND_SOURCE_LABELS[source] || source} sound…`, 'busy');
+                    try {
+                        const patch = gatherAlerts();
+                        await ipcRenderer.invoke('settings:save', { section: 'alerts', patch });
+                        const res = await ipcRenderer.invoke('settings:test', { kind: 'alert-sound', params: { source } });
+                        if (!res?.ok) throw new Error(res?.error || 'Test failed');
+                        setStatus(`Played ${SOUND_SOURCE_LABELS[source] || source} sound`, 'ok');
+                    } catch (e) {
+                        setStatus(e.message || String(e), 'err');
+                    }
+                });
+            });
+        }
+
         function gatherAlerts() {
             const sources = {};
             document.querySelectorAll('#alerts-matrix tbody tr').forEach((row) => {
@@ -861,6 +926,12 @@
                 });
             });
             const prev = settings.alerts || {};
+            const sounds = { ...(prev.sounds || {}) };
+            document.querySelectorAll('[data-sound-source]').forEach((row) => {
+                const key = row.dataset.soundSource;
+                if (!key) return;
+                sounds[key] = row.querySelector('.alert-sound-path')?.value?.trim() || '';
+            });
             return {
                 ...prev,
                 quietHours: {
@@ -868,6 +939,9 @@
                     start: document.getElementById('alerts-quietStart').value.trim(),
                     end: document.getElementById('alerts-quietEnd').value.trim(),
                 },
+                floatingAlertBanner: document.getElementById('alerts-floatingBanner').checked,
+                desktopNotifications: document.getElementById('alerts-desktopNotifications').checked,
+                sounds,
                 sources,
             };
         }
@@ -878,6 +952,10 @@
                 trayIconStyle: document.getElementById('ui-trayIconStyle').value,
                 showFloatingHud: document.getElementById('ui-showFloatingHud').checked,
                 pushEnabled: document.getElementById('ui-pushEnabled').checked,
+                callCameraName: document.getElementById('ui-callCamera').value,
+                callDetectZoom: document.getElementById('ui-callDetectZoom').checked,
+                callDetectWeb: document.getElementById('ui-callDetectWeb').checked,
+                callDetectCamera: document.getElementById('ui-callDetectCamera').checked,
                 launchAtLogin: document.getElementById('ui-launchAtLogin').checked,
             };
         }
@@ -885,6 +963,7 @@
         function gatherGeneral() {
             return {
                 timezone: document.getElementById('general-timezone').value.trim(),
+                alertSound: document.getElementById('general-alertSound').value.trim(),
                 audioOutput: document.getElementById('general-audioOutput').value.trim(),
                 audioInput: document.getElementById('general-audioInput').value.trim(),
             };
@@ -956,6 +1035,7 @@
             document.getElementById('ha-token').value = settings.homeassistant?.token || '';
             document.getElementById('ha-notifyTarget').value = settings.homeassistant?.notifyTarget || '';
             document.getElementById('ha-dismissEntity').value = settings.homeassistant?.dismissEntity || '';
+            document.getElementById('ha-pushEntity').value = settings.homeassistant?.pushEntity || '';
             document.getElementById('ha-awayThreshold').value = settings.homeassistant?.awayThresholdSeconds || '300';
             document.getElementById('ha-urgentMode').value = settings.homeassistant?.urgentMode || 'tts';
 
@@ -1005,6 +1085,8 @@
             const al = settings.alerts || {};
             document.getElementById('alerts-quietStart').value = al.quietHours?.start || '22:00';
             document.getElementById('alerts-quietEnd').value = al.quietHours?.end || '07:00';
+            document.getElementById('alerts-floatingBanner').checked = al.floatingAlertBanner !== false;
+            document.getElementById('alerts-desktopNotifications').checked = al.desktopNotifications === true;
             SOURCE_KEYS.forEach((src) => {
                 const row = document.querySelector(`#alerts-matrix tr[data-source="${src}"]`);
                 if (!row) return;
@@ -1014,6 +1096,7 @@
                     if (cb) cb.checked = srcCfg[ch] !== false;
                 });
             });
+            renderAlertSounds(al.sounds || {});
 
             const tn = settings.tunnel || {};
             const tnr = tn.rules || {};
@@ -1059,11 +1142,35 @@
             pushEl.disabled = ui.pushAvailable === false;
             document.getElementById('ui-push-help').style.display = ui.pushAvailable === false ? '' : 'none';
             document.getElementById('ui-launchAtLogin').checked = Boolean(ui.launchAtLogin);
+            document.getElementById('ui-callDetectZoom').checked = ui.callDetectZoom !== false;
+            document.getElementById('ui-callDetectWeb').checked = ui.callDetectWeb !== false;
+            document.getElementById('ui-callDetectCamera').checked = ui.callDetectCamera !== false;
+            loadCameras(ui.callCameraName || '');
             document.getElementById('general-timezone').value = settings.general?.timezone || '';
+            document.getElementById('general-alertSound').value = settings.general?.alertSound || '';
             document.getElementById('general-audioOutput').value = settings.general?.audioOutput || '';
             document.getElementById('general-audioInput').value = settings.general?.audioInput || '';
 
             isPopulating = false;
+        }
+
+        async function loadCameras(selected) {
+            const sel = document.getElementById('ui-callCamera');
+            if (!sel) return;
+            const current = selected != null ? selected : sel.value;
+            let cams = [];
+            try { cams = await ipcRenderer.invoke('cameras:list') || []; } catch { cams = []; }
+            const opts = ['<option value="">Off — don\'t detect by camera</option>'];
+            // Ensure the saved camera still appears even if not currently listed.
+            if (current && !cams.some((c) => c.name === current)) {
+                opts.push(`<option value="${escapeHtml(current)}">${escapeHtml(current)} (not connected)</option>`);
+            }
+            for (const c of cams) {
+                const label = `${c.name}${c.running ? ' (in use)' : ''}`;
+                opts.push(`<option value="${escapeHtml(c.name)}">${escapeHtml(label)}</option>`);
+            }
+            sel.innerHTML = opts.join('');
+            sel.value = current || '';
         }
 
         async function saveSection(section, { quiet = false } = {}) {
@@ -1111,6 +1218,37 @@
             const hosts = [...list.querySelectorAll('.light-ip')].map((el) => el.value.trim()).filter(Boolean);
             hosts.push('');
             renderLights(hosts);
+        };
+
+        document.getElementById('general-alertSound-browse').onclick = async () => {
+            try {
+                const res = await ipcRenderer.invoke('settings:pick-sound-file');
+                if (res?.ok && res.path) {
+                    document.getElementById('general-alertSound').value = res.path;
+                    scheduleDirtyCheck();
+                }
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
+        };
+
+        document.getElementById('ui-callCamera-refresh').onclick = async () => {
+            setStatus('Scanning cameras…', 'busy');
+            await loadCameras();
+            setStatus('Cameras refreshed', 'ok');
+        };
+
+        document.getElementById('general-alertSound-test').onclick = async () => {
+            setStatus('Playing alert sound…', 'busy');
+            try {
+                const patch = gatherGeneral();
+                await ipcRenderer.invoke('settings:save', { section: 'general', patch });
+                const res = await ipcRenderer.invoke('settings:test', { kind: 'alert-sound', params: { source: 'meetings' } });
+                if (!res?.ok) throw new Error(res?.error || 'Test failed');
+                setStatus('Played alert sound', 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
         };
 
         document.getElementById('lights-detect').onclick = async () => {
@@ -1182,8 +1320,10 @@
         document.getElementById('ha-test-gentle').onclick = async () => {
             setStatus('Sending gentle push…', 'busy');
             try {
-                await ipcRenderer.invoke('settings:test', { kind: 'push-gentle', params: {} });
-                setStatus('Gentle push sent', 'ok');
+                const r = await ipcRenderer.invoke('settings:test', { kind: 'push-gentle', params: {} });
+                if (r?.sent) setStatus('Gentle push sent', 'ok');
+                else if (r?.disabled) setStatus('Skipped — phone alerts are OFF (toggle in HA or the Orbit menu)', 'err');
+                else setStatus('Not delivered — check Home Assistant config', 'err');
             } catch (e) {
                 setStatus(e.message || String(e), 'err');
             }
@@ -1192,8 +1332,10 @@
         document.getElementById('ha-test-urgent').onclick = async () => {
             setStatus('Sending urgent push…', 'busy');
             try {
-                await ipcRenderer.invoke('settings:test', { kind: 'push-urgent', params: {} });
-                setStatus('Urgent push sent', 'ok');
+                const r = await ipcRenderer.invoke('settings:test', { kind: 'push-urgent', params: {} });
+                if (r?.sent) setStatus('Urgent push sent', 'ok');
+                else if (r?.disabled) setStatus('Skipped — phone alerts are OFF (toggle in HA or the Orbit menu)', 'err');
+                else setStatus('Not delivered — check Home Assistant config', 'err');
             } catch (e) {
                 setStatus(e.message || String(e), 'err');
             }

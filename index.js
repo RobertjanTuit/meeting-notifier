@@ -44,6 +44,7 @@ class OrbitNotifier extends EventEmitter {
         super();
         this.credentialsPath = credentialsPath;
         this.dataDir = dataDir;
+        this._defaultSoundPath = soundPath;
         this.soundPath = soundPath;
         this.calendar = null;
         this.calendarClients = [];
@@ -58,6 +59,11 @@ class OrbitNotifier extends EventEmitter {
         this.lastError = null;
         this._zoomIsRunning = null;
         this._zoomCheckInterval = null;
+        this._callDetectors = [];
+        /** Whether the native Zoom (CptHost) process check is allowed to mark you in-call. */
+        this.zoomProcessDetectionEnabled = true;
+        /** Human label of whatever is currently marking you "in a call" (or null). */
+        this.callSource = null;
         this._meetingPollTask = null;
         this._meetingPollTimer = null;
         this._authServer = null;
@@ -72,9 +78,9 @@ class OrbitNotifier extends EventEmitter {
         if (value === this._zoomIsRunning) return;
         this._zoomIsRunning = value;
         if (value) {
-            console.log(chalk.green('✓ Zoom is running'));
+            console.log(chalk.green('✓ In a call (Zoom / Meet / ClickUp)'));
         } else {
-            console.log(chalk.gray('No active Zoom processes found'));
+            console.log(chalk.gray('No active call detected'));
         }
         this._syncMeetingLights().catch((err) => {
             console.error(chalk.red('Error syncing meeting lights:'), err.message);
@@ -279,8 +285,29 @@ class OrbitNotifier extends EventEmitter {
         }
     }
 
+    /**
+     * Register an extra async detector. It should return a truthy *reason label*
+     * (string) when you're in a call, or a falsy value otherwise. OR'd with Zoom.
+     */
+    addCallDetector(fn) {
+        if (typeof fn === 'function') this._callDetectors.push(fn);
+    }
+
     async checkIfZoomRunning() {
-        this.zoomIsRunning = await this.isZoomRunning();
+        let source = null;
+        if (this.zoomProcessDetectionEnabled !== false && await this.isZoomRunning()) {
+            source = 'Zoom';
+        }
+        if (!source) {
+            for (const detect of this._callDetectors) {
+                try {
+                    const reason = await detect();
+                    if (reason) { source = typeof reason === 'string' ? reason : 'In a call'; break; }
+                } catch { /* detector failed — ignore */ }
+            }
+        }
+        this.callSource = source;
+        this.zoomIsRunning = Boolean(source);
     }
 
     /**
@@ -493,14 +520,28 @@ class OrbitNotifier extends EventEmitter {
                 console.error(chalk.red('Error writing events to file:'), error.message);
             }
 
+            // Cheap "does this event have a video/conference link?" check used to
+            // keep real calls that only list you as an attendee (e.g. large
+            // all-hands / webinars) while still dropping solo personal blocks.
+            const hasVideoLink = (event) => {
+                if (event.conferenceData?.entryPoints?.some((e) => e.entryPointType === 'video')) return true;
+                if (event.hangoutLink) return true;
+                const desc = (event.description || '').replace(/<[^>]*>/g, '');
+                if (/zoom\.us\/j\/|meet\.google\.com\/|teams\.microsoft\.com\//i.test(desc)) return true;
+                if (event.location && /^https?:\/\//i.test(event.location.trim())) return true;
+                return false;
+            };
+
             // Shared "is this a real meeting we care about" predicate.
             const isActionable = (event) => {
                 if (!event.start?.dateTime) return false;                // skip all-day
                 if (event.colorId === '2' || event.colorId === '3') return false;
                 if (event.eventType === 'outOfOffice') return false;
-                if (!event.attendees || event.attendees.length < 2) return false; // skip solo
-                const self = event.attendees.find((a) => a.self);
+                const self = (event.attendees || []).find((a) => a.self);
                 if (self?.responseStatus === 'declined') return false;   // skip declined
+                // Skip solo events (no co-attendees) unless they carry a video link —
+                // a 1-attendee event with a Zoom/Meet link is usually a broadcast/all-hands.
+                if ((!event.attendees || event.attendees.length < 2) && !hasVideoLink(event)) return false;
                 return true;
             };
 
@@ -588,28 +629,39 @@ class OrbitNotifier extends EventEmitter {
         }
     }
 
-    async playDingSound() {
-        const customSound = this.soundPath;
+    resolveAlertSoundPath(source) {
+        if (typeof this._resolveAlertSound === 'function') {
+            return this._resolveAlertSound(source);
+        }
+        return this.soundPath;
+    }
 
-        if (!fs.existsSync(customSound)) {
+    async playAlertSound(source) {
+        const soundFile = this.resolveAlertSoundPath(source);
+
+        if (!soundFile || !fs.existsSync(soundFile)) {
             return;
         }
 
         let command;
         if (process.platform === 'win32') {
-            command = `powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Media.SoundPlayer]::new('${customSound}').PlaySync()"`;
+            command = `powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Media.SoundPlayer]::new('${soundFile}').PlaySync()"`;
         } else if (process.platform === 'darwin') {
-            command = `afplay "${customSound}"`;
+            command = `afplay "${soundFile}"`;
         } else {
-            command = `sh -c 'paplay "${customSound}" 2>/dev/null || aplay "${customSound}" 2>/dev/null'`;
+            command = `sh -c 'paplay "${soundFile}" 2>/dev/null || aplay "${soundFile}" 2>/dev/null'`;
         }
 
         exec(command, (error) => {
             if (error) {
-                console.error(chalk.red('Error playing sound:'), error.message);
+                console.error(chalk.red('Error playing alert sound:'), error.message);
             }
         });
-        console.log(chalk.magenta('🔔 *custom ding*'));
+        console.log(chalk.magenta(`🔔 ${path.basename(soundFile)}`));
+    }
+
+    async playDingSound(source) {
+        return this.playAlertSound(source);
     }
 
     async turnOnLights() {
@@ -629,7 +681,9 @@ class OrbitNotifier extends EventEmitter {
      * (sound + screen still pulse).
      */
 
-    async pulseAlert(times = 1, duration = 1000, { lights = true, sound = true, flash = true } = {}) {
+    async pulseAlert(times = 1, duration = 1000, {
+        lights = true, sound = true, flash = true, soundSource = 'meetings',
+    } = {}) {
         if (this.isBlinking) return;
         const hasLights = lights && this.keyLights.length > 0;
         this.isBlinking = true;
@@ -641,7 +695,7 @@ class OrbitNotifier extends EventEmitter {
                 }
             }
             for (let i = 0; i < times; i++) {
-                if (sound) this.playDingSound();
+                if (sound) this.playAlertSound(soundSource);
                 if (flash) this.emit('blink-on');
                 if (hasLights) {
                     await Promise.all(this.keyLights.map((light) =>
@@ -840,6 +894,19 @@ class OrbitNotifier extends EventEmitter {
 
     reinitializeLights() {
         this.initializeElgatoLights();
+    }
+
+    reinitializeSound() {
+        const custom = process.env.ALERT_SOUND?.trim();
+        if (custom && fs.existsSync(custom)) {
+            this.soundPath = custom;
+            console.log(chalk.green(`✓ Alert sound: ${custom}`));
+            return;
+        }
+        if (custom) {
+            console.warn(chalk.yellow(`⚠ Alert sound not found: ${custom} — using default`));
+        }
+        this.soundPath = this._defaultSoundPath;
     }
 
     reloadCalendarAuth() {

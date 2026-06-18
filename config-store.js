@@ -99,6 +99,15 @@ const DEFAULT_RULES = {
     },
     alerts: {
         quietHours: { start: '22:00', end: '07:00', timezone: 'America/Los_Angeles' },
+        desktopNotifications: false,
+        floatingAlertBanner: true,
+        sounds: {
+            default: '',
+            meetings: '',
+            clickup: '',
+            email: '',
+            datadog: '',
+        },
         sources: {
             meetings: { lights: true, sound: true, flash: true, push: true },
             clickup: { lights: true, sound: true, flash: false, push: true },
@@ -135,10 +144,10 @@ const PROCESS_ENV_FALLBACK_KEYS = [
     'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI',
     'ELGATO_KEY_LIGHTS', 'CALENDAR_ID', 'TIMEZONE',
     'HA_URL', 'HA_TOKEN', 'HA_NOTIFY_TARGET', 'PUSH_AWAY_THRESHOLD_SECONDS',
-    'PUSH_URGENT_MODE', 'HA_DISMISS_ENTITY',
+    'PUSH_URGENT_MODE', 'HA_DISMISS_ENTITY', 'HA_PUSH_ENTITY',
     'CLICKUP_ENV', 'CLICKUP_API_TOKEN', 'CLICKUP_WORKSPACE_ID', 'CLICKUP_API_BASE_URL',
     'DD_API_KEY', 'DD_APP_KEY', 'DD_SITE',
-    'CLOUDFLARE_TUNNEL_TOKEN',
+    'CLOUDFLARE_TUNNEL_TOKEN', 'ALERT_SOUND',
 ];
 
 function mergeMissingEnvKeys(destEnvPath, ...sourceEnvPaths) {
@@ -276,6 +285,7 @@ function createConfigStore(configDir, { extraEnvSources = [] } = {}) {
                     awayThresholdSeconds: e.PUSH_AWAY_THRESHOLD_SECONDS || '300',
                     urgentMode: e.PUSH_URGENT_MODE || 'tts',
                     dismissEntity: e.HA_DISMISS_ENTITY || 'input_boolean.orbit_dismiss',
+                    pushEntity: e.HA_PUSH_ENTITY || 'input_boolean.orbit_phone_push',
                 };
             case 'clickup': {
                 const rules = readJsonFile(rulesPath('clickup'), DEFAULT_RULES.clickup);
@@ -310,6 +320,7 @@ function createConfigStore(configDir, { extraEnvSources = [] } = {}) {
             case 'general':
                 return {
                     timezone: e.TIMEZONE || 'America/Los_Angeles',
+                    alertSound: e.ALERT_SOUND || '',
                     audioOutput: e.AUDIO_OUTPUT_DEVICE || 'BlackHole 2ch',
                     audioInput: e.AUDIO_INPUT_DEVICE || 'Elgato Wave Link Chat Mix',
                     waveLinkProcess: e.WAVE_LINK_PROCESS || 'WaveLinkMacOS',
@@ -339,7 +350,7 @@ function createConfigStore(configDir, { extraEnvSources = [] } = {}) {
     function saveSection(section, patch) {
         const envUpdates = {};
         const restart = {
-            calendar: false, lights: false, clickup: false, email: false, datadog: false, tunnel: false,
+            calendar: false, lights: false, sound: false, clickup: false, email: false, datadog: false, tunnel: false,
         };
         switch (section) {
             case 'lights':
@@ -385,6 +396,7 @@ function createConfigStore(configDir, { extraEnvSources = [] } = {}) {
                 if (patch.awayThresholdSeconds != null) envUpdates.PUSH_AWAY_THRESHOLD_SECONDS = String(patch.awayThresholdSeconds);
                 if (patch.urgentMode != null) envUpdates.PUSH_URGENT_MODE = patch.urgentMode;
                 if (patch.dismissEntity != null) envUpdates.HA_DISMISS_ENTITY = patch.dismissEntity;
+                if (patch.pushEntity != null) envUpdates.HA_PUSH_ENTITY = patch.pushEntity;
                 break;
             case 'clickup':
                 if (patch.env != null) envUpdates.CLICKUP_ENV = patch.env;
@@ -440,6 +452,10 @@ function createConfigStore(configDir, { extraEnvSources = [] } = {}) {
                 break;
             case 'general':
                 if (patch.timezone != null) envUpdates.TIMEZONE = patch.timezone;
+                if (patch.alertSound != null) {
+                    envUpdates.ALERT_SOUND = patch.alertSound;
+                    restart.sound = true;
+                }
                 if (patch.audioOutput != null) envUpdates.AUDIO_OUTPUT_DEVICE = patch.audioOutput;
                 if (patch.audioInput != null) envUpdates.AUDIO_INPUT_DEVICE = patch.audioInput;
                 if (patch.waveLinkProcess != null) envUpdates.WAVE_LINK_PROCESS = patch.waveLinkProcess;
