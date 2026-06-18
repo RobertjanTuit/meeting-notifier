@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>Orbit — Alert History</title>
+    <style>
+        :root { color-scheme: dark; }
+        *, *::before, *::after { box-sizing: border-box; }
+        html, body { margin: 0; height: 100%; background: #1e1e1e; color: #d4d4d4; }
+        body {
+            font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            display: flex; flex-direction: column;
+        }
+        header {
+            padding: 10px 14px; border-bottom: 1px solid #333; display: flex;
+            gap: 10px; align-items: center; flex-wrap: wrap; background: #252526;
+        }
+        header .grow { flex: 1; }
+        select, input[type="search"] {
+            background: #3c3c3c; color: #d4d4d4; border: 1px solid #555;
+            border-radius: 5px; padding: 5px 8px; font-size: 12px;
+        }
+        input[type="search"] { width: 200px; }
+        button {
+            background: #0e639c; color: #fff; border: none; border-radius: 5px;
+            padding: 6px 12px; font-size: 12px; cursor: pointer;
+        }
+        button.secondary { background: #3a3d41; }
+        label.chk { font-size: 12px; color: #ccc; display: flex; align-items: center; gap: 4px; }
+        #list { flex: 1; overflow-y: auto; padding: 8px 10px; }
+        .row {
+            display: flex; gap: 10px; align-items: flex-start; padding: 9px 10px;
+            border: 1px solid #333; border-radius: 8px; margin-bottom: 7px; background: #252526;
+        }
+        .row.dismissed { opacity: 0.55; }
+        .row.clickable { cursor: pointer; }
+        .row.clickable:hover { border-color: #0e639c; }
+        .badge {
+            font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+            padding: 2px 7px; border-radius: 999px; white-space: nowrap; margin-top: 2px;
+            background: #3a3d41; color: #ddd;
+        }
+        .badge.meetings { background: #2d4a7c; }
+        .badge.clickup { background: #6b3fa0; }
+        .badge.email { background: #3f7d5a; }
+        .badge.datadog { background: #7c5a2d; }
+        .badge.test { background: #555; }
+        .body { flex: 1; min-width: 0; }
+        .title { font-weight: 600; color: #fff; }
+        .title .urgent { color: #f48771; font-size: 11px; margin-left: 6px; }
+        .title .count-pill { color: #7ec8ff; font-size: 11px; margin-left: 4px; }
+        .msg { color: #bbb; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .meta { color: #777; font-size: 11px; margin-top: 2px; }
+        .empty { color: #777; text-align: center; padding: 40px 0; }
+        .count { color: #888; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <header>
+        <select id="filter-source">
+            <option value="">All sources</option>
+            <option value="meetings">Meetings</option>
+            <option value="clickup">ClickUp</option>
+            <option value="email">Email</option>
+            <option value="datadog">Datadog</option>
+            <option value="test">Test</option>
+            <option value="orbit">Orbit</option>
+        </select>
+        <select id="filter-status">
+            <option value="">All</option>
+            <option value="active">Active only</option>
+            <option value="dismissed">Dismissed only</option>
+        </select>
+        <input type="search" id="filter-search" placeholder="Search title or message…" />
+        <span class="count" id="count"></span>
+        <span class="grow"></span>
+        <button class="secondary" id="clear">Clear history</button>
+    </header>
+    <div id="list"><div class="empty">No alerts yet.</div></div>
+
+    <script>
+        const { ipcRenderer } = require('electron');
+        let history = [];
+
+        const sourceEl = document.getElementById('filter-source');
+        const statusEl = document.getElementById('filter-status');
+        const searchEl = document.getElementById('filter-search');
+        const listEl = document.getElementById('list');
+        const countEl = document.getElementById('count');
+
+        function esc(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        function fmtTime(ts) {
+            const d = new Date(ts);
+            const today = new Date();
+            const sameDay = d.toDateString() === today.toDateString();
+            const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+            return sameDay ? time : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
+        }
+
+        function render() {
+            const src = sourceEl.value;
+            const status = statusEl.value;
+            const q = searchEl.value.trim().toLowerCase();
+            const rows = history.filter((h) => {
+                if (src && h.source !== src) return false;
+                if (status === 'active' && h.dismissedAt) return false;
+                if (status === 'dismissed' && !h.dismissedAt) return false;
+                if (q && !(`${h.title} ${h.message}`.toLowerCase().includes(q))) return false;
+                return true;
+            });
+            countEl.textContent = `${rows.length} of ${history.length}`;
+            if (!rows.length) {
+                listEl.innerHTML = '<div class="empty">No alerts match the current filters.</div>';
+                return;
+            }
+            listEl.innerHTML = rows.map((h) => {
+                const clickable = h.url || h.message ? ' clickable' : '';
+                return `<div class="row${h.dismissedAt ? ' dismissed' : ''}${clickable}" data-id="${h.id}">
+                    <span class="badge ${esc(h.source)}">${esc(h.source)}</span>
+                    <div class="body">
+                        <div class="title">${esc(h.title)}${h.count > 1 ? ` <span class="count-pill">×${h.count}</span>` : ''}${h.urgent ? '<span class="urgent">URGENT</span>' : ''}</div>
+                        <div class="msg">${esc(h.message)}</div>
+                        <div class="meta">${fmtTime(h.at)}${h.dismissedAt ? ' · dismissed' : ''}${h.url ? ' · click to open' : ''}</div>
+                    </div>
+                </div>`;
+            }).join('');
+            listEl.querySelectorAll('.row.clickable').forEach((row) => {
+                row.addEventListener('click', () => {
+                    const item = history.find((x) => String(x.id) === row.dataset.id);
+                    if (item) ipcRenderer.send('alert-history:open-item', item.url || '', item.message || '');
+                });
+            });
+        }
+
+        sourceEl.addEventListener('change', render);
+        statusEl.addEventListener('change', render);
+        searchEl.addEventListener('input', render);
+        document.getElementById('clear').addEventListener('click', () => {
+            if (confirm('Clear all alert history? This cannot be undone.')) {
+                ipcRenderer.send('alert-history:clear');
+            }
+        });
+
+        ipcRenderer.on('alert-history:update', (_e, data) => {
+            history = Array.isArray(data) ? data : [];
+            render();
+        });
+
+        (async () => {
+            history = await ipcRenderer.invoke('alert-history:get') || [];
+            render();
+        })();
+    </script>
+</body>
+</html>

@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: transparent;
+        }
+        body {
+            font: 12px/1.35 -apple-system, BlinkMacSystemFont, sans-serif;
+            color: #eee;
+            padding: 0;
+        }
+        .panel {
+            background: rgba(24, 24, 26, 0.96);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 10px;
+            box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+            overflow: hidden;
+            max-height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+        .head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 10px 6px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            -webkit-app-region: drag;
+        }
+        .head strong { font-size: 11px; font-weight: 600; color: #ccc; letter-spacing: 0.02em; }
+        .head button {
+            -webkit-app-region: no-drag;
+            background: none;
+            border: none;
+            color: #888;
+            font-size: 11px;
+            cursor: pointer;
+            padding: 2px 4px;
+        }
+        .head button:hover { color: #f48771; }
+        .list {
+            overflow-y: auto;
+            max-height: 320px;
+        }
+        .item {
+            padding: 10px 10px 9px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            cursor: pointer;
+            position: relative;
+        }
+        .item:hover { background: rgba(255, 255, 255, 0.04); }
+        .item:last-child { border-bottom: none; }
+        .row1 { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+        .badge {
+            font-size: 9px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            padding: 1px 5px;
+            border-radius: 4px;
+            flex-shrink: 0;
+        }
+        .badge.meetings { background: #1e3a5a; color: #7ec8ff; }
+        .badge.clickup { background: #3a3218; color: #ffd866; }
+        .badge.email { background: #1e3a28; color: #89d185; }
+        .badge.datadog { background: #3a1e1e; color: #f48771; }
+        .badge.orbit, .badge.test, .badge.tunnel { background: #333; color: #aaa; }
+        .title {
+            flex: 1;
+            min-width: 0;
+            font-weight: 600;
+            font-size: 12px;
+            color: #f0f0f0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .age { font-size: 10px; color: #777; flex-shrink: 0; }
+        .msg {
+            font-size: 11px;
+            color: #aaa;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            padding-right: 18px;
+        }
+        .dismiss {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            background: none;
+            border: none;
+            color: #666;
+            font-size: 16px;
+            line-height: 1;
+            cursor: pointer;
+            padding: 0 2px;
+        }
+        .dismiss:hover { color: #f48771; }
+        .empty { padding: 16px; text-align: center; color: #666; font-size: 11px; }
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <div class="head">
+            <strong>Orbit alerts</strong>
+            <button type="button" id="dismiss-all">Dismiss all</button>
+        </div>
+        <div class="list" id="list"></div>
+    </div>
+    <script>
+        const { ipcRenderer } = require('electron');
+
+        const listEl = document.getElementById('list');
+        const dismissAllBtn = document.getElementById('dismiss-all');
+
+        function escapeHtml(s) {
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function formatAge(at) {
+            const sec = Math.max(0, Math.floor((Date.now() - at) / 1000));
+            if (sec < 60) return 'now';
+            if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+            return `${Math.floor(sec / 3600)}h`;
+        }
+
+        function badgeClass(source) {
+            const s = String(source || 'orbit').toLowerCase();
+            if (['meetings', 'clickup', 'email', 'datadog'].includes(s)) return s;
+            return 'orbit';
+        }
+
+        function render(alerts) {
+            if (!alerts?.length) {
+                listEl.innerHTML = '<div class="empty">No alerts</div>';
+                dismissAllBtn.style.display = 'none';
+                ipcRenderer.send('alert-panel:resize', 360, 72);
+                return;
+            }
+            dismissAllBtn.style.display = '';
+            listEl.innerHTML = alerts.map((a) => (
+                `<div class="item" data-id="${a.id}">` +
+                `<button type="button" class="dismiss" data-dismiss="${a.id}" title="Dismiss">×</button>` +
+                `<div class="row1">` +
+                `<span class="badge ${badgeClass(a.source)}">${escapeHtml(a.source || 'orbit')}</span>` +
+                `<span class="title">${escapeHtml(a.title || 'Orbit')}${a.count > 1 ? ` (${a.count})` : ''}</span>` +
+                `<span class="age">${formatAge(a.at)}</span></div>` +
+                `<div class="msg">${escapeHtml(a.message || '')}</div></div>`
+            )).join('');
+
+            listEl.querySelectorAll('.item').forEach((el) => {
+                el.addEventListener('click', (e) => {
+                    if (e.target.closest('.dismiss')) return;
+                    ipcRenderer.send('alert-panel:open', Number(el.dataset.id));
+                });
+            });
+            listEl.querySelectorAll('.dismiss').forEach((btn) => {
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    ipcRenderer.send('alert-panel:dismiss', Number(btn.dataset.dismiss));
+                });
+            });
+
+            requestAnimationFrame(() => {
+                const headH = 34;
+                const h = Math.min(360, Math.max(88, headH + listEl.scrollHeight + 4));
+                ipcRenderer.send('alert-panel:resize', 360, h);
+            });
+        }
+
+        dismissAllBtn.onclick = () => ipcRenderer.send('alert-panel:dismiss-all');
+
+        ipcRenderer.on('alert-panel:update', (_e, alerts) => render(alerts));
+
+        setInterval(() => {
+            const items = [...listEl.querySelectorAll('.item')];
+            if (!items.length) return;
+            ipcRenderer.invoke('alert-panel:get').then(render).catch(() => {});
+        }, 30000);
+    </script>
+</body>
+</html>

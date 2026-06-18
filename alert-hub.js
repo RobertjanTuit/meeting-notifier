@@ -24,6 +24,34 @@ class AlertHub extends EventEmitter {
         this.isPushEnabled = isPushEnabled;
         this.shouldPushForMeeting = shouldPushForMeeting || (() => true);
         this.lastClickUpSummary = null;
+        // Content-based de-duplication: the same logical alert (even if pushed
+        // multiple times by polling + webhook, or webhook retries) only fires once
+        // within the window.
+        this._recentDeliveries = new Map();
+        this._dedupWindowMs = 60 * 60 * 1000;
+    }
+
+    _dedupKey({ source, title, message, meta, kind, meeting }) {
+        if (source === 'meetings') {
+            const day = new Date().toISOString().slice(0, 10);
+            return `meetings|${kind || ''}|${meeting?.id || meeting?.iCalUID || title}|${day}`;
+        }
+        if (source === 'clickup') {
+            const id = meta?.messageId || meta?.taskId || meta?.event || '';
+            return `clickup|${meta?.reason || ''}|${id}|${title}|${message}`;
+        }
+        return `${source}|${title}|${message}|${meta?.url || ''}`;
+    }
+
+    /** True if this alert was already delivered within the dedup window. */
+    _isDuplicate(key) {
+        const now = Date.now();
+        for (const [k, ts] of this._recentDeliveries) {
+            if (now - ts > this._dedupWindowMs) this._recentDeliveries.delete(k);
+        }
+        if (this._recentDeliveries.has(key)) return true;
+        this._recentDeliveries.set(key, now);
+        return false;
     }
 
     getAlertsConfig() {
@@ -54,7 +82,7 @@ class AlertHub extends EventEmitter {
         return mins >= start && mins < end;
     }
 
-    async maybePush({ source, title, message, urgent, url, meeting }) {
+    async maybePush({ source, title, message, urgent, url, meeting, spoken }) {
         const cfg = this.getSourceDelivery(source);
         if (!cfg.push || !this.isPushEnabled()) return false;
         if (source === 'meetings') {
@@ -63,14 +91,20 @@ class AlertHub extends EventEmitter {
             return false;
         }
         const { sendHaPush } = require('./push.js');
-        await sendHaPush({ title, message, urgent, url });
+        await sendHaPush({ title, message, urgent, url, spoken });
         return true;
     }
 
-    async deliver({ source, title, message, urgent = false, url, meeting, meta }) {
+    async deliver({ source, title, message, urgent = false, url, meeting, meta, spoken }) {
         if (this.inQuietHours()) {
             console.log(`🔕 Alert skipped (quiet hours): [${source}] ${title}`);
             return { delivered: false, reason: 'quiet-hours' };
+        }
+
+        const dedupKey = this._dedupKey({ source, title, message, meta });
+        if (this._isDuplicate(dedupKey)) {
+            console.log(`♻️ Duplicate alert suppressed: [${source}] ${title}`);
+            return { delivered: false, reason: 'duplicate' };
         }
 
         const cfg = this.getSourceDelivery(source);
@@ -81,18 +115,22 @@ class AlertHub extends EventEmitter {
                 lights: cfg.lights,
                 sound: cfg.sound,
                 flash: cfg.flash && urgent,
+                soundSource: source,
             });
         }
 
-        await this.maybePush({ source, title, message, urgent, url, meeting });
+        await this.maybePush({ source, title, message, urgent, url, meeting, spoken });
 
         if (source === 'clickup') {
             this.lastClickUpSummary = { title, message, at: Date.now(), meta };
             this.emit('clickup-alert', this.lastClickUpSummary);
         }
 
+        const groupKey = meta?.taskId
+            ? `clickup:task:${meta.taskId}`
+            : (source === 'clickup' && url ? `clickup:url:${url}` : undefined);
         console.log(`🔔 [${source}] ${title} — ${message}`);
-        this.emit('delivered', { source, title, message, urgent, meta });
+        this.emit('delivered', { source, title, message, urgent, meta, url, groupKey });
         return { delivered: true };
     }
 
@@ -121,12 +159,15 @@ class AlertHub extends EventEmitter {
                 lights: cfg.lights,
                 sound: cfg.sound,
                 flash: cfg.flash,
+                soundSource: 'meetings',
             });
         }
 
+        const url = meeting?.videoEntryPoint?.uri;
         const pushed = await this.maybePush({ source: 'meetings', title, message, urgent, meeting });
+        const groupKey = `meetings:${meeting?.id || meeting?.iCalUID || title}`;
         console.log(`🔔 [meetings] ${title} — ${message}`);
-        this.emit('delivered', { source: 'meetings', title, message, urgent, kind, meeting });
+        this.emit('delivered', { source: 'meetings', title, message, urgent, kind, meeting, url, groupKey });
         return { delivered: true, pushed };
     }
 }
