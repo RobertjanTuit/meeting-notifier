@@ -55,9 +55,13 @@ class ClickUpClient {
     }
     async getTaggedUsers(taggedUsersUrl) {
         if (!taggedUsersUrl) return [];
-        const apiPath = taggedUsersUrl.startsWith('http')
-            ? taggedUsersUrl.replace(this.baseUrl, '')
-            : taggedUsersUrl;
+        // ClickUp returns an absolute api host link; keep only the path so it also works when
+        // baseUrl is the local relay proxy.
+        let apiPath = taggedUsersUrl;
+        if (taggedUsersUrl.startsWith('http')) {
+            try { const u = new URL(taggedUsersUrl); apiPath = `${u.pathname}${u.search}`; }
+            catch { apiPath = taggedUsersUrl.replace(this.baseUrl, ''); }
+        }
         try {
             const data = await this.request(apiPath);
             return data.data || data.tagged_users || data.users || [];
@@ -110,11 +114,15 @@ class ClickUpWatcher extends EventEmitter {
     _client(overrides = {}) {
         const section = this._rules();
         const rules = section.rules || {};
+        // While the R2 relay is up, every ClickUp call goes through its loopback proxy so Orbit,
+        // the relay and local Cursor sessions spend one shared rate budget. Relay down → direct.
+        const relayBase = String(rules.relayFeedUrl || 'http://127.0.0.1:8787').replace(/\/+$/, '');
+        const viaRelay = (rules.chatSource || 'relay') === 'relay' && this._relayUp !== false && !section.apiBaseUrl;
         const cfg = resolveClickUpConfig({
             CLICKUP_ENV: overrides.env ?? section.env,
             CLICKUP_API_TOKEN: overrides.apiToken ?? section.apiToken,
             CLICKUP_WORKSPACE_ID: overrides.workspaceId ?? section.workspaceId,
-            CLICKUP_API_BASE_URL: section.apiBaseUrl,
+            CLICKUP_API_BASE_URL: viaRelay ? `${relayBase}/clickup` : section.apiBaseUrl,
             workspaceId: overrides.workspaceId ?? rules.workspaceId,
         });
         if (!cfg.token) throw new Error('CLICKUP API token is not set — enter it above');
@@ -353,6 +361,16 @@ class ClickUpWatcher extends EventEmitter {
             myUserId = user.user?.id || user.id;
         }
 
+        const source = rules.chatSource || 'relay';
+        if (source === 'relay') {
+            const fed = await this._pollRelayFeed({ rules, client, cfg, seen, myUserId });
+            if (fed) { this._saveSeen(cfg.environment, seen); return; }
+            // Relay down: crawl directly, but no faster than the fallback interval.
+            const fallbackMs = Math.max(30, Number(rules.directFallbackIntervalSeconds) || 120) * 1000;
+            if (Date.now() - (this._lastDirectPollAt || 0) < fallbackMs) return;
+            this._lastDirectPollAt = Date.now();
+        }
+
         const channelsRes = await client.getChannels(cfg.workspaceId);
         const channels = channelsRes.data || channelsRes.channels || [];
         const watchIds = new Set((rules.watchChannelIds || []).map(String));
@@ -362,36 +380,101 @@ class ClickUpWatcher extends EventEmitter {
             const res = await client.getMessages(cfg.workspaceId, channel.id);
             const messages = res.data || res.messages || [];
             for (const msg of messages) {
-                const key = `${channel.id}:${msg.id}`;
-                if (seen.has(key)) continue;
-                seen.add(key);
-
-                if (Date.now() - Number(msg.date || 0) > 10 * 60 * 1000) continue;
-                if (String(msg.user_id) === String(myUserId)) continue;
-
-                const decision = await this._shouldAlert(msg, rules, client, myUserId);
-                if (!decision.notify) continue;
-
-                const channelName = channel.name || channel.id;
-                log.clickup(`Chat alert (${decision.reason}) in #${channelName}: ${this._snippet(msg.content)}`);
-
-                const senderName = msg.user?.username || msg.username || this._memberLabel(msg.user_id);
-                const spoken = decision.reason === 'dm-from-watched-person'
-                    ? this._spokenPhrase(senderName, channelName)
-                    : `Mention in ${this._firstWords(channelName, 3)}`;
-
-                await this.alertHub.deliver({
-                    source: 'clickup',
-                    title: `ClickUp: ${channelName}`,
-                    message: this._snippet(msg.content) || '(no text)',
-                    urgent: Boolean(decision.urgent),
-                    url: `https://app.clickup.com/${cfg.workspaceId}/chat/r/${channel.id}`,
-                    spoken,
-                    meta: { reason: decision.reason, messageId: msg.id },
-                });
+                await this._handleChatMessage({ channel, msg, rules, client, cfg, seen, myUserId });
             }
         }
         this._saveSeen(cfg.environment, seen);
+    }
+
+    /**
+     * Read new Chat messages from the R2 local relay instead of ClickUp. The relay has already paid
+     * the request for every channel it crawls, so this costs zero ClickUp budget. Returns false when
+     * the relay is unreachable so the caller can fall back to a (slow) direct crawl.
+     */
+    async _pollRelayFeed({ rules, client, cfg, seen, myUserId }) {
+        const base = String(rules.relayFeedUrl || 'http://127.0.0.1:8787').replace(/\/+$/, '');
+        const since = Number(this._relayCursor || 0);
+        let body;
+        try {
+            const res = await fetch(`${base}/feed?since=${since}&limit=1000`, { signal: AbortSignal.timeout(5000) });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            body = await res.json();
+        } catch (err) {
+            this._relayUp = false;
+            if (!this._relayDownLogged) {
+                log.clickup(`Relay feed unreachable (${err.message}); falling back to direct ClickUp polling`);
+                this._relayDownLogged = true;
+            }
+            return false;
+        }
+        this._relayUp = true;
+        if (this._relayDownLogged) {
+            log.clickup('Relay feed reachable again; direct polling stopped');
+            this._relayDownLogged = false;
+        }
+        const items = Array.isArray(body.items) ? body.items : [];
+        // First contact, or the relay restarted with a lower cursor: adopt it and only look at
+        // the recent tail instead of replaying the relay's whole buffer.
+        const relayCursor = Number(body.cursor) || 0;
+        if ((!this._relayCursor && since === 0) || relayCursor < since) {
+            this._relayCursor = relayCursor;
+            let tail = items;
+            if (relayCursor < since) {
+                // The relay answered since=<old cursor> with nothing useful; refetch its recent tail once.
+                try {
+                    const res = await fetch(`${base}/feed?since=0&limit=1000`, { signal: AbortSignal.timeout(5000) });
+                    if (res.ok) tail = (await res.json()).items || [];
+                } catch { tail = []; }
+            }
+            const recent = tail.filter((it) => Date.now() - Number(it.date || 0) <= 10 * 60 * 1000);
+            for (const it of recent) await this._handleFeedItem({ it, rules, client, cfg, seen, myUserId });
+            return true;
+        }
+        for (const it of items) await this._handleFeedItem({ it, rules, client, cfg, seen, myUserId });
+        if (Number.isFinite(Number(body.cursor))) this._relayCursor = Number(body.cursor);
+        return true;
+    }
+
+    async _handleFeedItem({ it, rules, client, cfg, seen, myUserId }) {
+        const channel = { id: it.channelId, name: it.channelName || it.channelId };
+        const msg = {
+            id: it.messageId,
+            user_id: it.userId,
+            date: it.date,
+            content: it.content,
+            links: it.taggedUsersUrl ? { tagged_users: it.taggedUsersUrl } : undefined,
+        };
+        await this._handleChatMessage({ channel, msg, rules, client, cfg, seen, myUserId });
+    }
+
+    async _handleChatMessage({ channel, msg, rules, client, cfg, seen, myUserId }) {
+        const key = `${channel.id}:${msg.id}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        if (Date.now() - Number(msg.date || 0) > 10 * 60 * 1000) return;
+        if (String(msg.user_id) === String(myUserId)) return;
+
+        const decision = await this._shouldAlert(msg, rules, client, myUserId);
+        if (!decision.notify) return;
+
+        const channelName = channel.name || channel.id;
+        log.clickup(`Chat alert (${decision.reason}) in #${channelName}: ${this._snippet(msg.content)}`);
+
+        const senderName = msg.user?.username || msg.username || this._memberLabel(msg.user_id);
+        const spoken = decision.reason === 'dm-from-watched-person'
+            ? this._spokenPhrase(senderName, channelName)
+            : `Mention in ${this._firstWords(channelName, 3)}`;
+
+        await this.alertHub.deliver({
+            source: 'clickup',
+            title: `ClickUp: ${channelName}`,
+            message: this._snippet(msg.content) || '(no text)',
+            urgent: Boolean(decision.urgent),
+            url: `https://app.clickup.com/${cfg.workspaceId}/chat/r/${channel.id}`,
+            spoken,
+            meta: { reason: decision.reason, messageId: msg.id },
+        });
     }
 
     async _myUserId(client, rules) {

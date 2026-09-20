@@ -55,6 +55,11 @@ const DEFAULT_RULES = {
         workspaceId: '333',
         myUserId: null,
         pollIntervalSeconds: 30,
+        // 'relay' reads the R2 local relay's /feed so Orbit and the relay share one ClickUp token budget;
+        // 'direct' crawls ClickUp itself. Relay unreachable -> direct at directFallbackIntervalSeconds.
+        chatSource: 'relay',
+        relayFeedUrl: 'http://127.0.0.1:8787',
+        directFallbackIntervalSeconds: 120,
         watchChannelIds: [],
         watchPeople: [],
         watchTaskIds: [],
