@@ -36,7 +36,7 @@ const {
     checkPublicTunnelHealth,
 } = require('./cloudflare-tunnel.js');
 const log = require('./orbit-log.js');
-const { showDesktopNotification: postDesktopNotification } = require('./desktop-notify.js');
+const { showDesktopNotification: postDesktopNotification, reapStaleNotifiers } = require('./desktop-notify.js');
 const { createSoundResolver } = require('./sound-resolver.js');
 
 let tray = null;
@@ -3253,6 +3253,10 @@ app.whenReady().then(() => {
     startPhonePushSubscription();
     startAudioRouter();
     startCameraWatchdog();
+    reapStaleNotifiers({ includeOrphans: true })
+        .then((n) => n && log.orbit(`Cleaned up ${n} stuck notification process(es)`))
+        .catch(() => {});
+    setInterval(() => reapStaleNotifiers().catch(() => {}), 5 * 60 * 1000);
     log.orbit('Started — use menu → Show console window to watch live activity');
 
     if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
