@@ -387,6 +387,7 @@
                 <label class="inline"><input type="checkbox" id="ui-callDetectZoom" /> Zoom app meetings</label>
                 <label class="inline"><input type="checkbox" id="ui-callDetectWeb" /> Browser video calls (Meet / Daily / Zoom web)</label>
                 <label class="inline"><input type="checkbox" id="ui-callDetectCamera" /> Meeting camera in use</label>
+                <label class="inline"><input type="checkbox" id="ui-elgatoCameraWatchdog" /> Keep Elgato virtual camera alive (restart Camera Hub when its feed freezes)</label>
                 <label class="field"><span>Meeting camera</span>
                     <div class="row">
                         <select id="ui-callCamera"><option value="">None selected</option></select>
@@ -1072,6 +1073,7 @@
                 launchAtLogin: document.getElementById('ui-launchAtLogin').checked,
                 audioAutoRoute: document.getElementById('ui-audioAutoRoute').checked,
                 waveLinkKeepAlive: document.getElementById('ui-waveLinkKeepAlive').checked,
+                elgatoCameraWatchdog: document.getElementById('ui-elgatoCameraWatchdog').checked,
                 audioPriority: gatherAudioPriority(),
             };
         }
@@ -1268,6 +1270,7 @@
             document.getElementById('general-audioInput').value = settings.general?.audioInput || '';
             document.getElementById('ui-audioAutoRoute').checked = ui.audioAutoRoute !== false;
             document.getElementById('ui-waveLinkKeepAlive').checked = ui.waveLinkKeepAlive !== false;
+            document.getElementById('ui-elgatoCameraWatchdog').checked = ui.elgatoCameraWatchdog !== false;
             const pri = Array.isArray(ui.audioPriority)
                 ? ui.audioPriority
                 : String(ui.audioPriority || '').split('\n').map((s) => s.trim()).filter(Boolean);

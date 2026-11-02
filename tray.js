@@ -18,6 +18,7 @@ const {
 } = require('./push.js');
 const { fixAudio } = require('./audio-fix.js');
 const { fixDisplays } = require('./display-fix.js');
+const { createElgatoCameraWatchdog } = require('./camera-fix.js');
 const {
     createAudioRouter,
     listCandidateOutputs,
@@ -130,6 +131,8 @@ let settingsPath = null;
 let audioAutoRoute = true;
 let audioPriority = [...DEFAULT_AUDIO_PRIORITY];
 let waveLinkKeepAlive = true;
+let elgatoCameraWatchdog = true;
+let cameraWatchdog = null;
 let audioRouter = null;
 let lastAudioRoute = { name: null, error: null, via: null, waveLink: null };
 
@@ -156,6 +159,7 @@ function loadSettings(dataDir) {
         if (typeof raw.callDetectCamera === 'boolean') callDetectCamera = raw.callDetectCamera;
         if (typeof raw.audioAutoRoute === 'boolean') audioAutoRoute = raw.audioAutoRoute;
         if (typeof raw.waveLinkKeepAlive === 'boolean') waveLinkKeepAlive = raw.waveLinkKeepAlive;
+        if (typeof raw.elgatoCameraWatchdog === 'boolean') elgatoCameraWatchdog = raw.elgatoCameraWatchdog;
         if (Array.isArray(raw.audioPriority) || typeof raw.audioPriority === 'string') {
             const pri = normalizePriority(raw.audioPriority);
             if (pri.length) audioPriority = pri;
@@ -180,6 +184,7 @@ function getUiSettings() {
         audioAutoRoute,
         audioPriority,
         waveLinkKeepAlive,
+        elgatoCameraWatchdog,
         audioRouteDevice: lastAudioRoute.name,
         audioRouteError: lastAudioRoute.error,
         audioRouteWarning: lastAudioRoute.warning || null,
@@ -216,6 +221,7 @@ function applyUiSettings(patch = {}) {
     }
     if (patch.audioAutoRoute != null) audioAutoRoute = Boolean(patch.audioAutoRoute);
     if (patch.waveLinkKeepAlive != null) waveLinkKeepAlive = Boolean(patch.waveLinkKeepAlive);
+    if (patch.elgatoCameraWatchdog != null) elgatoCameraWatchdog = Boolean(patch.elgatoCameraWatchdog);
     if (patch.audioPriority != null) {
         const pri = normalizePriority(patch.audioPriority);
         audioPriority = pri.length ? pri : [...DEFAULT_AUDIO_PRIORITY];
@@ -276,6 +282,27 @@ function startAudioRouter() {
     audioRouter.start();
 }
 
+function startCameraWatchdog() {
+    if (cameraWatchdog || process.platform !== 'darwin') return;
+    cameraWatchdog = createElgatoCameraWatchdog({
+        getConfig: () => ({ enabled: elgatoCameraWatchdog }),
+        onLog: (message) => log.camera(message),
+        onRestart: ({ ok, error, manual }) => {
+            lastMenuSignature = null;
+            if (trayPaths) refreshUI(trayPaths);
+            if (!ok) log.cameraWarn(error);
+            postDesktopNotification({
+                title: ok ? 'Elgato camera restarted' : 'Elgato camera restart failed',
+                body: ok
+                    ? (manual ? 'Camera Hub restarted.' : 'The virtual camera froze, so Camera Hub was restarted.')
+                    : `${error}. Open Camera Hub to check the camera.`,
+            }).catch(() => {});
+        },
+    });
+    cameraWatchdog.start();
+    if (trayPaths) buildMenu(trayPaths);
+}
+
 async function routeAudioNow({ notify = false } = {}) {
     if (!audioRouter) startAudioRouter();
     const result = await audioRouter.applyNow();
@@ -312,7 +339,7 @@ function saveSettings() {
         const data = {
             pushEnabled, menuBarTitle, trayIconStyle, showFloatingHud, sawLaunchNotification,
             callCameraName, callDetectZoom, callDetectWeb, callDetectCamera,
-            audioAutoRoute, audioPriority, waveLinkKeepAlive,
+            audioAutoRoute, audioPriority, waveLinkKeepAlive, elgatoCameraWatchdog,
         };
         if (hudUserPosition) {
             data.hudX = hudUserPosition.x;
@@ -2666,6 +2693,8 @@ function menuStructureSignature(paths) {
         connectionIssues: collectConnectionIssues().map((i) => `${i.id}:${i.detail}`).join('|'),
         audioAutoRoute,
         waveLinkKeepAlive,
+        elgatoCameraWatchdog,
+        cameraRestarting: cameraWatchdog?.isRestarting() || false,
         audioDevice: lastAudioRoute.name,
         audioErr: lastAudioRoute.error,
         audioWarn: lastAudioRoute.warning,
@@ -2872,6 +2901,23 @@ function buildMenu(paths) {
             click: () => audioRouter?.restartWaveLink('not responding').catch((err) => log.audioError(err.message)),
         });
     }
+
+    items.push({
+        label: 'Keep Elgato virtual camera alive',
+        type: 'checkbox',
+        checked: elgatoCameraWatchdog,
+        enabled: process.platform === 'darwin',
+        click: (item) => applyUiSettings({ elgatoCameraWatchdog: item.checked }),
+    });
+    items.push({
+        label: cameraWatchdog?.isRestarting() ? 'Restarting Elgato camera…' : 'Fix Elgato camera',
+        enabled: process.platform === 'darwin' && !cameraWatchdog?.isRestarting(),
+        click: () => {
+            if (!cameraWatchdog) startCameraWatchdog();
+            cameraWatchdog.restartNow().then(() => trayPaths && buildMenu(trayPaths)).catch((err) => log.cameraWarn(err.message));
+            if (trayPaths) buildMenu(trayPaths);
+        },
+    });
 
     items.push({
         label: displayFixRunning ? 'Fixing displays…' : 'Fix displays',
@@ -3206,6 +3252,7 @@ app.whenReady().then(() => {
     startPhonePushPolling();
     startPhonePushSubscription();
     startAudioRouter();
+    startCameraWatchdog();
     log.orbit('Started — use menu → Show console window to watch live activity');
 
     if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
@@ -3276,6 +3323,8 @@ function cleanup() {
     notifier?.stop();
     audioRouter?.stop();
     audioRouter = null;
+    cameraWatchdog?.stop();
+    cameraWatchdog = null;
     stopTunnelHealthMonitor();
     stopCloudflareTunnel();
     if (webhookServer) {

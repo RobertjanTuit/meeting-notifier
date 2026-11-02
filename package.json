@@ -41,6 +41,7 @@
       "push.js",
       "audio-fix.js",
       "display-fix.js",
+      "camera-fix.js",
       "audio-route.js",
       "setup-auth.js",
       "assets/icon.png",

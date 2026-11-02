@@ -20,4 +20,6 @@ module.exports = {
     audio: (message, ...extra) => write('log', 'audio', message, ...extra),
     audioWarn: (message, ...extra) => write('warn', 'audio', message, ...extra),
     audioError: (message, ...extra) => write('error', 'audio', message, ...extra),
+    camera: (message, ...extra) => write('log', 'camera', message, ...extra),
+    cameraWarn: (message, ...extra) => write('warn', 'camera', message, ...extra),
 };
