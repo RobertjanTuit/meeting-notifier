@@ -142,6 +142,16 @@
         .wlp-add[disabled] { background: #444; color: #888; cursor: default; }
         .wlp-empty, .wlp-status { font-size: 11px; color: #888; padding: 8px 10px; }
         .wlp-status.err { color: #f48771; }
+        .audio-pri-row {
+            display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+        }
+        .audio-pri-row .audio-pri-name { flex: 1; min-width: 0; }
+        .audio-available { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 12px; }
+        .audio-available button {
+            background: #3c3c3c; color: #ccc; font-size: 11px; padding: 4px 8px;
+        }
+        .audio-available button:hover { background: #4a4a4a; }
+        .audio-available button.in-list { opacity: 0.45; cursor: default; }
     </style>
 </head>
 <body>
@@ -396,7 +406,22 @@
                 <p class="help">WAV, MP3, or AIFF file played on alert pulses. Leave blank for the built-in ding.</p>
                 <label class="field"><span>Audio output device</span><input type="text" id="general-audioOutput" placeholder="BlackHole 2ch" /></label>
                 <label class="field"><span>Audio input device</span><input type="text" id="general-audioInput" placeholder="Elgato Wave Link Chat Mix" /></label>
+                <p class="help">These are the macOS defaults used by Diagnostics → Fix Audio (apps into Wave Link). Listening output below is Wave Link’s Main mix.</p>
+                <span class="field"><span>Listening output</span></span>
+                <label class="inline"><input type="checkbox" id="ui-audioAutoRoute" /> Auto-route Wave Link Main output</label>
+                <label class="inline"><input type="checkbox" id="ui-waveLinkKeepAlive" /> Keep Wave Link running (restart it when it crashes or stops responding)</label>
+                <span class="field"><span>Priority order (first connected wins)</span></span>
+                <div id="ui-audio-priority-list"></div>
+                <div class="row">
+                    <input type="text" id="ui-audio-custom" placeholder="Add a device name (e.g. Pixel Buds)" />
+                    <button type="button" class="secondary small" id="ui-audio-add-custom">Add</button>
+                </div>
+                <span class="field"><span>Connected now — click to add</span></span>
+                <div class="audio-available" id="ui-audio-available"></div>
+                <p class="help" id="ui-audio-status">Default: Arctis, then Pixel Buds, then MacBook speakers. Names match as substrings so USB-port duplicates still count. Uncheck auto-route to stop switching.</p>
                 <div class="actions">
+                    <button type="button" class="secondary" id="ui-audio-refresh">Refresh devices</button>
+                    <button type="button" class="secondary" id="ui-audio-route-now">Route now</button>
                     <button type="button" data-save="general-ui">Save</button>
                 </div>
             </section>
@@ -500,6 +525,94 @@
                 list.appendChild(row);
             });
             scheduleDirtyCheck();
+        }
+
+        function gatherAudioPriority() {
+            return [...document.querySelectorAll('#ui-audio-priority-list .audio-pri-name')]
+                .map((el) => el.value.trim())
+                .filter(Boolean);
+        }
+
+        function renderAudioPriority(names) {
+            const list = document.getElementById('ui-audio-priority-list');
+            if (!list) return;
+            list.innerHTML = '';
+            const items = names?.length ? names : [];
+            items.forEach((name, i) => {
+                const row = document.createElement('div');
+                row.className = 'audio-pri-row';
+                row.innerHTML = `
+                    <input type="text" class="audio-pri-name" value="${escapeAttr(name)}" />
+                    <button type="button" class="secondary small audio-pri-up" ${i === 0 ? 'disabled' : ''}>↑</button>
+                    <button type="button" class="secondary small audio-pri-down" ${i === items.length - 1 ? 'disabled' : ''}>↓</button>
+                    <button type="button" class="danger small audio-pri-remove">Remove</button>`;
+                row.querySelector('.audio-pri-up').onclick = () => {
+                    const cur = gatherAudioPriority();
+                    if (i === 0) return;
+                    [cur[i - 1], cur[i]] = [cur[i], cur[i - 1]];
+                    renderAudioPriority(cur);
+                    loadAudioOutputs();
+                    scheduleDirtyCheck();
+                };
+                row.querySelector('.audio-pri-down').onclick = () => {
+                    const cur = gatherAudioPriority();
+                    if (i >= cur.length - 1) return;
+                    [cur[i + 1], cur[i]] = [cur[i], cur[i + 1]];
+                    renderAudioPriority(cur);
+                    loadAudioOutputs();
+                    scheduleDirtyCheck();
+                };
+                row.querySelector('.audio-pri-remove').onclick = () => {
+                    const cur = gatherAudioPriority().filter((_, idx) => idx !== i);
+                    renderAudioPriority(cur);
+                    loadAudioOutputs();
+                    scheduleDirtyCheck();
+                };
+                list.appendChild(row);
+            });
+        }
+
+        function addAudioPriorityName(name) {
+            const n = String(name || '').trim();
+            if (!n) return;
+            const cur = gatherAudioPriority();
+            if (cur.some((x) => x.toLowerCase() === n.toLowerCase())) return;
+            cur.push(n);
+            renderAudioPriority(cur);
+            loadAudioOutputs();
+            scheduleDirtyCheck();
+        }
+
+        async function loadAudioOutputs() {
+            const box = document.getElementById('ui-audio-available');
+            if (!box) return;
+            const inList = new Set(gatherAudioPriority().map((s) => s.toLowerCase()));
+            let devices = [];
+            try {
+                const res = await ipcRenderer.invoke('settings:action', { action: 'audio-list-outputs' });
+                devices = res?.ok ? (res.devices || []) : [];
+            } catch {
+                devices = [];
+            }
+            box.innerHTML = '';
+            if (!devices.length) {
+                box.innerHTML = '<span class="help">No devices found</span>';
+                return;
+            }
+            for (const name of devices) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.textContent = name;
+                const listed = inList.has(name.toLowerCase())
+                    || [...inList].some((p) => name.toLowerCase().includes(p) || p.includes(name.toLowerCase()));
+                if (listed) {
+                    btn.className = 'in-list';
+                    btn.disabled = true;
+                } else {
+                    btn.onclick = () => addAudioPriorityName(name);
+                }
+                box.appendChild(btn);
+            }
         }
 
         function gatherLights() {
@@ -957,6 +1070,9 @@
                 callDetectWeb: document.getElementById('ui-callDetectWeb').checked,
                 callDetectCamera: document.getElementById('ui-callDetectCamera').checked,
                 launchAtLogin: document.getElementById('ui-launchAtLogin').checked,
+                audioAutoRoute: document.getElementById('ui-audioAutoRoute').checked,
+                waveLinkKeepAlive: document.getElementById('ui-waveLinkKeepAlive').checked,
+                audioPriority: gatherAudioPriority(),
             };
         }
 
@@ -1150,6 +1266,27 @@
             document.getElementById('general-alertSound').value = settings.general?.alertSound || '';
             document.getElementById('general-audioOutput').value = settings.general?.audioOutput || '';
             document.getElementById('general-audioInput').value = settings.general?.audioInput || '';
+            document.getElementById('ui-audioAutoRoute').checked = ui.audioAutoRoute !== false;
+            document.getElementById('ui-waveLinkKeepAlive').checked = ui.waveLinkKeepAlive !== false;
+            const pri = Array.isArray(ui.audioPriority)
+                ? ui.audioPriority
+                : String(ui.audioPriority || '').split('\n').map((s) => s.trim()).filter(Boolean);
+            renderAudioPriority(pri.length ? pri : ['Arctis Nova Pro Wireless', 'Pixel Buds', 'MacBook Pro Speakers']);
+            loadAudioOutputs();
+            const status = document.getElementById('ui-audio-status');
+            if (ui.audioRouteError) {
+                status.textContent = ui.audioRouteError;
+                status.className = 'help err';
+            } else if (ui.audioRouteWarning) {
+                status.textContent = `${ui.audioRouteWarning}${ui.audioRouteDevice ? ` — system output on ${ui.audioRouteDevice}` : ''}${ui.waveLink?.restarting ? ' — restarting Wave Link…' : ''}`;
+                status.className = 'help err';
+            } else if (ui.audioRouteDevice) {
+                status.textContent = `Current listening output: ${ui.audioRouteDevice}`;
+                status.className = 'help ok';
+            } else {
+                status.textContent = 'Default: Arctis, then Pixel Buds, then MacBook speakers. Names match as substrings so USB-port duplicates still count. Uncheck auto-route to stop switching.';
+                status.className = 'help';
+            }
 
             isPopulating = false;
         }
@@ -1236,6 +1373,36 @@
             setStatus('Scanning cameras…', 'busy');
             await loadCameras();
             setStatus('Cameras refreshed', 'ok');
+        };
+
+        document.getElementById('ui-audio-add-custom').onclick = () => {
+            addAudioPriorityName(document.getElementById('ui-audio-custom').value);
+            document.getElementById('ui-audio-custom').value = '';
+        };
+        document.getElementById('ui-audio-custom').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                document.getElementById('ui-audio-add-custom').click();
+            }
+        });
+        document.getElementById('ui-audio-refresh').onclick = async () => {
+            setStatus('Scanning audio devices…', 'busy');
+            await loadAudioOutputs();
+            setStatus('Devices refreshed', 'ok');
+        };
+
+        document.getElementById('ui-audio-route-now').onclick = async () => {
+            setStatus('Routing audio…', 'busy');
+            try {
+                const result = await ipcRenderer.invoke('settings:action', { action: 'audio-route-now' });
+                if (!result?.ok) throw new Error(result?.error || 'Route failed');
+                settings = await ipcRenderer.invoke('settings:get') || {};
+                populateAll(settings);
+                resetSnapshot();
+                setStatus(result.device ? `Listening on ${result.device}` : 'Routed', 'ok');
+            } catch (e) {
+                setStatus(e.message || String(e), 'err');
+            }
         };
 
         document.getElementById('general-alertSound-test').onclick = async () => {

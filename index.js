@@ -13,10 +13,12 @@ require('dotenv').config();
 
 const execAsync = promisify(exec);
 
-// Elgato blink appearance: gentle, warm. brightness 0-100; temperature uses the
-// Elgato API range (~143 cool .. 344 warm), higher = warmer/yellower.
-const BLINK_BRIGHTNESS = 45;
+// Elgato blink appearance: brightness 0-100, as an offset from the light's base
+// brightness (dips instead when the base is too bright to go up). Temperature uses
+// the Elgato API range (~143 cool .. 344 warm), higher = warmer/yellower.
+const BLINK_BRIGHTNESS_DELTA = 30;
 const BLINK_TEMPERATURE = 320;
+const LIGHT_BASELINE_FILE = 'elgato-baseline.json';
 
 // Default per-calendar behavior. Override per calendar in calendars.json.
 const DEFAULT_CALENDAR_CONFIG = {
@@ -55,6 +57,7 @@ class OrbitNotifier extends EventEmitter {
         this.scheduledNotifications = [];
         this.scheduledNotificationLogs = [];
         this.keyLights = [];
+        this._lightBaselines = this._loadLightBaselines();
         this.status = 'idle';
         this.lastError = null;
         this._zoomIsRunning = null;
@@ -97,11 +100,60 @@ class OrbitNotifier extends EventEmitter {
         }
     }
 
-    _restoreLightAfterPulse(host, original) {
-        if (this._zoomIsRunning) {
-            return this.setElgatoLightData(host, { on: 1 });
+    _loadLightBaselines() {
+        try {
+            return JSON.parse(fs.readFileSync(path.join(this.dataDir, LIGHT_BASELINE_FILE), 'utf8')) || {};
+        } catch {
+            return {};
         }
-        return this.setElgatoLightData(host, original?.on === 1 ? original : { on: 0 });
+    }
+
+    _saveLightBaselines() {
+        try {
+            fs.writeFileSync(path.join(this.dataDir, LIGHT_BASELINE_FILE), JSON.stringify(this._lightBaselines, null, 2));
+        } catch (error) {
+            console.error(chalk.red('Error saving Elgato baseline:'), error.message);
+        }
+    }
+
+    /**
+     * Read the light and, if it is on and Orbit is not mid-flash, remember its
+     * brightness/temperature as the base to return to. An off light is never
+     * learned from: its stored values may be a leftover flash level.
+     */
+    async _captureLightBaseline(host) {
+        const state = (await this.getElgatoLightData(host))?.lights?.[0] || null;
+        if (state?.on === 1 && !this.isBlinking && Number.isFinite(state.brightness)) {
+            const prev = this._lightBaselines[host];
+            if (prev?.brightness !== state.brightness || prev?.temperature !== state.temperature) {
+                this._lightBaselines[host] = { brightness: state.brightness, temperature: state.temperature };
+                this._saveLightBaselines();
+            }
+        }
+        return state;
+    }
+
+    _baselineFor(host) {
+        const b = this._lightBaselines[host];
+        if (!b) return {};
+        const out = {};
+        if (Number.isFinite(b.brightness)) out.brightness = b.brightness;
+        if (Number.isFinite(b.temperature)) out.temperature = b.temperature;
+        return out;
+    }
+
+    _flashStateFor(host) {
+        const base = this._baselineFor(host).brightness;
+        if (!Number.isFinite(base)) return { on: 1, temperature: BLINK_TEMPERATURE };
+        const up = base + BLINK_BRIGHTNESS_DELTA;
+        const brightness = up <= 100 ? up : Math.max(3, base - BLINK_BRIGHTNESS_DELTA);
+        return { on: 1, brightness, temperature: BLINK_TEMPERATURE };
+    }
+
+    /** Put the light back at its base, on or off, so no flash level is left stored in it. */
+    _restoreLightAfterPulse(host, original) {
+        const on = this._zoomIsRunning || original?.on === 1 ? 1 : 0;
+        return this.setElgatoLightData(host, { on, ...this._baselineFor(host) });
     }
 
     _setStatus(status, error = null) {
@@ -665,11 +717,16 @@ class OrbitNotifier extends EventEmitter {
     }
 
     async turnOnLights() {
-        await Promise.all(this.keyLights.map((light) => this.setElgatoLightData(light, { on: 1 })));
+        await Promise.all(this.keyLights.map((light) =>
+            this.setElgatoLightData(light, { on: 1, ...this._baselineFor(light) })
+        ));
     }
 
     async turnOffLights() {
-        await Promise.all(this.keyLights.map((light) => this.setElgatoLightData(light, { on: 0 })));
+        await Promise.all(this.keyLights.map(async (light) => {
+            await this._captureLightBaseline(light);
+            await this.setElgatoLightData(light, { on: 0, ...this._baselineFor(light) });
+        }));
     }
 
     /**
@@ -686,24 +743,21 @@ class OrbitNotifier extends EventEmitter {
     } = {}) {
         if (this.isBlinking) return;
         const hasLights = lights && this.keyLights.length > 0;
+        const originalStates = {};
+        if (hasLights) {
+            for (const light of this.keyLights) {
+                originalStates[light] = await this._captureLightBaseline(light);
+            }
+        }
+        if (this.isBlinking) return;
         this.isBlinking = true;
         try {
-            const originalStates = {};
-            if (hasLights) {
-                for (const light of this.keyLights) {
-                    originalStates[light] = (await this.getElgatoLightData(light))?.lights?.[0];
-                }
-            }
             for (let i = 0; i < times; i++) {
                 if (sound) this.playAlertSound(soundSource);
                 if (flash) this.emit('blink-on');
                 if (hasLights) {
                     await Promise.all(this.keyLights.map((light) =>
-                        this.setElgatoLightData(light, {
-                            on: 1,
-                            brightness: BLINK_BRIGHTNESS,
-                            temperature: BLINK_TEMPERATURE,
-                        })
+                        this.setElgatoLightData(light, this._flashStateFor(light))
                     ));
                 }
                 await this.sleep(duration / 2);
@@ -717,13 +771,9 @@ class OrbitNotifier extends EventEmitter {
             }
             if (hasLights) {
                 await this.sleep(500);
-                if (this._zoomIsRunning) {
-                    await this.turnOnLights();
-                } else {
-                    await Promise.all(this.keyLights.map((light) =>
-                        originalStates[light] ? this.setElgatoLightData(light, originalStates[light]) : null
-                    ));
-                }
+                await Promise.all(this.keyLights.map((light) =>
+                    this._restoreLightAfterPulse(light, originalStates[light])
+                ));
             }
         } catch (error) {
             console.error(chalk.red('Error pulsing alert:'), error.message);
@@ -950,22 +1000,18 @@ class OrbitNotifier extends EventEmitter {
 
     async blinkLightAt(host, times = 1, duration = 600) {
         if (!host || this.isBlinking) return;
+        const original = await this._captureLightBaseline(host);
+        if (this.isBlinking) return;
         this.isBlinking = true;
         try {
-            const original = (await this.getElgatoLightData(host))?.lights?.[0];
             for (let i = 0; i < times; i++) {
                 this.playDingSound();
                 this.emit('blink-on');
-                await this.setElgatoLightData(host, { on: 1, brightness: BLINK_BRIGHTNESS, temperature: BLINK_TEMPERATURE });
+                await this.setElgatoLightData(host, this._flashStateFor(host));
                 await this.sleep(duration / 2);
                 this.emit('blink-off');
                 await this._restoreLightAfterPulse(host, original);
                 if (i < times - 1) await this.sleep(duration / 2);
-            }
-            if (this._zoomIsRunning) {
-                await this.setElgatoLightData(host, { on: 1 });
-            } else if (original) {
-                await this.setElgatoLightData(host, original);
             }
         } catch (error) {
             console.error(chalk.red(`Error blinking light ${host}:`), error.message);

@@ -17,6 +17,13 @@ const {
     pushEntityId,
 } = require('./push.js');
 const { fixAudio } = require('./audio-fix.js');
+const { fixDisplays } = require('./display-fix.js');
+const {
+    createAudioRouter,
+    listCandidateOutputs,
+    DEFAULT_AUDIO_PRIORITY,
+    normalizePriority,
+} = require('./audio-route.js');
 const { createConfigStore } = require('./config-store.js');
 const { AlertHub } = require('./alert-hub.js');
 const { ClickUpWatcher } = require('./clickup.js');
@@ -120,6 +127,11 @@ let trayIconStyle = 'text';
 /** Floating pill under the menu bar — reliable on macOS 26 when Control Center hides the tray */
 let showFloatingHud = true;
 let settingsPath = null;
+let audioAutoRoute = true;
+let audioPriority = [...DEFAULT_AUDIO_PRIORITY];
+let waveLinkKeepAlive = true;
+let audioRouter = null;
+let lastAudioRoute = { name: null, error: null, via: null, waveLink: null };
 
 function loadSettings(dataDir) {
     settingsPath = path.join(dataDir, 'settings.json');
@@ -142,6 +154,12 @@ function loadSettings(dataDir) {
         if (typeof raw.callDetectZoom === 'boolean') callDetectZoom = raw.callDetectZoom;
         if (typeof raw.callDetectWeb === 'boolean') callDetectWeb = raw.callDetectWeb;
         if (typeof raw.callDetectCamera === 'boolean') callDetectCamera = raw.callDetectCamera;
+        if (typeof raw.audioAutoRoute === 'boolean') audioAutoRoute = raw.audioAutoRoute;
+        if (typeof raw.waveLinkKeepAlive === 'boolean') waveLinkKeepAlive = raw.waveLinkKeepAlive;
+        if (Array.isArray(raw.audioPriority) || typeof raw.audioPriority === 'string') {
+            const pri = normalizePriority(raw.audioPriority);
+            if (pri.length) audioPriority = pri;
+        }
     } catch {
         // first run — defaults apply
     }
@@ -159,6 +177,13 @@ function getUiSettings() {
         callDetectWeb,
         callDetectCamera,
         launchAtLogin: app.getLoginItemSettings().openAtLogin,
+        audioAutoRoute,
+        audioPriority,
+        waveLinkKeepAlive,
+        audioRouteDevice: lastAudioRoute.name,
+        audioRouteError: lastAudioRoute.error,
+        audioRouteWarning: lastAudioRoute.warning || null,
+        waveLink: audioRouter?.waveLinkStatus() || null,
     };
 }
 
@@ -189,6 +214,12 @@ function applyUiSettings(patch = {}) {
             openAsHidden: true,
         });
     }
+    if (patch.audioAutoRoute != null) audioAutoRoute = Boolean(patch.audioAutoRoute);
+    if (patch.waveLinkKeepAlive != null) waveLinkKeepAlive = Boolean(patch.waveLinkKeepAlive);
+    if (patch.audioPriority != null) {
+        const pri = normalizePriority(patch.audioPriority);
+        audioPriority = pri.length ? pri : [...DEFAULT_AUDIO_PRIORITY];
+    }
     saveSettings();
     lastMenuSignature = null;
     cachedAppMenu = null;
@@ -196,6 +227,83 @@ function applyUiSettings(patch = {}) {
     updateTrayTitle();
     updateHudWindow();
     if (trayPaths) refreshUI(trayPaths);
+    if (audioRouter && (patch.audioAutoRoute != null || patch.audioPriority != null)) {
+        if (audioAutoRoute) {
+            audioRouter.tick().catch((err) => log.audioError(err.message));
+        }
+    }
+}
+
+function startAudioRouter() {
+    if (audioRouter || process.platform !== 'darwin') return;
+    audioRouter = createAudioRouter({
+        getConfig: () => ({
+            enabled: audioAutoRoute,
+            priority: audioPriority,
+            waveLinkKeepAlive,
+        }),
+        monitorPath: app.isPackaged
+            ? path.join(process.resourcesPath, 'audio-device-monitor')
+            : path.join(__dirname, 'bin', 'audio-device-monitor'),
+        onLog: (message) => log.audio(message),
+        onChange: (result) => {
+            lastAudioRoute = {
+                name: result.device?.name || null,
+                error: result.error || null,
+                warning: result.warning || null,
+                via: result.via || null,
+                waveLink: result.waveLink || null,
+            };
+            if (result.ok && result.changed) {
+                const note = result.via !== 'system' ? '' : result.waveLink === 'unreachable' ? ' (system, Wave Link not responding)' : ' (system, Wave Link off)';
+                log.audio(`Main output → ${result.device.name}${note}`);
+            } else if (!result.ok && result.error) {
+                log.audioWarn(result.error);
+            }
+            if (result.warning) log.audioWarn(result.warning);
+            lastMenuSignature = null;
+            if (trayPaths) refreshUI(trayPaths);
+        },
+        onWaveLinkRestart: ({ ok, reason, error }) => {
+            lastMenuSignature = null;
+            if (trayPaths) refreshUI(trayPaths);
+            postDesktopNotification({
+                title: ok ? 'Wave Link restarted' : 'Wave Link restart failed',
+                body: ok ? `It had ${reason}. Audio routing restored.` : `${reason}: ${error || 'still not responding'}. Try Diagnostics → Fix Audio.`,
+            }).catch(() => {});
+        },
+    });
+    audioRouter.start();
+}
+
+async function routeAudioNow({ notify = false } = {}) {
+    if (!audioRouter) startAudioRouter();
+    const result = await audioRouter.applyNow();
+    lastAudioRoute = {
+        name: result.device?.name || lastAudioRoute.name,
+        error: result.error || null,
+        warning: result.warning || null,
+        via: result.via || lastAudioRoute.via,
+        waveLink: result.waveLink || lastAudioRoute.waveLink,
+    };
+    lastMenuSignature = null;
+    if (trayPaths) refreshUI(trayPaths);
+    if (!notify) return result;
+    if (result.ok) {
+        log.audio(`Routed now → ${result.device?.name || '?'}`);
+        if (result.waveLink === 'unreachable' && waveLinkKeepAlive) {
+            audioRouter.restartWaveLink('not responding').catch((err) => log.audioError(err.message));
+        }
+    } else {
+        log.audioError(result.error || 'Route audio failed');
+        dialog.showMessageBoxSync({
+            type: 'warning',
+            title: 'Route audio failed',
+            message: result.error || 'Unknown error',
+            detail: result.steps?.length ? result.steps.join('\n') : undefined,
+        });
+    }
+    return result;
 }
 
 function saveSettings() {
@@ -204,6 +312,7 @@ function saveSettings() {
         const data = {
             pushEnabled, menuBarTitle, trayIconStyle, showFloatingHud, sawLaunchNotification,
             callCameraName, callDetectZoom, callDetectWeb, callDetectCamera,
+            audioAutoRoute, audioPriority, waveLinkKeepAlive,
         };
         if (hudUserPosition) {
             data.hudX = hudUserPosition.x;
@@ -361,7 +470,10 @@ function initPresenceTracking() {
     powerMonitor.on('lock-screen', () => { screenLocked = true; });
     powerMonitor.on('unlock-screen', () => { screenLocked = false; });
     powerMonitor.on('suspend', () => { screenLocked = true; });
-    powerMonitor.on('resume', () => { screenLocked = false; });
+    powerMonitor.on('resume', () => {
+        screenLocked = false;
+        if (audioAutoRoute) audioRouter?.tick().catch((err) => log.audioError(err.message));
+    });
 }
 
 // Browsers we know how to read tabs from. `proc` is the exact process name used
@@ -1593,6 +1705,21 @@ function registerSettingsHandlers() {
                 const status = await restartCloudflareTunnel();
                 return { ok: true, status: status || cloudflareTunnel?.getStatus() };
             }
+            if (action === 'audio-list-outputs') {
+                const devices = await listCandidateOutputs();
+                return { ok: true, devices };
+            }
+            if (action === 'audio-route-now') {
+                const result = await routeAudioNow({ notify: false });
+                return {
+                    ok: result.ok,
+                    device: result.device?.name,
+                    via: result.via,
+                    changed: result.changed,
+                    error: result.error,
+                    steps: result.steps,
+                };
+            }
             if (action === 'clickup-register-webhook') {
                 if (!clickUpWatcher) return { ok: false, error: 'ClickUp watcher not initialized' };
                 const section = configStore.getSection('clickup');
@@ -2537,6 +2664,13 @@ function menuStructureSignature(paths) {
         tunnelHealth: tunnelHealth.ok,
         tunnelHealthErr: tunnelHealth.error,
         connectionIssues: collectConnectionIssues().map((i) => `${i.id}:${i.detail}`).join('|'),
+        audioAutoRoute,
+        waveLinkKeepAlive,
+        audioDevice: lastAudioRoute.name,
+        audioErr: lastAudioRoute.error,
+        audioWarn: lastAudioRoute.warning,
+        waveLink: lastAudioRoute.waveLink,
+        waveLinkRestarting: audioRouter?.waveLinkStatus().restarting,
     });
 }
 
@@ -2565,6 +2699,30 @@ function applyMenu(menu) {
     if (tray && !tray.isDestroyed()) tray.setContextMenu(menu);
     if (process.platform === 'darwin' && app.dock?.setMenu) {
         app.dock.setMenu(menu);
+    }
+}
+
+let displayFixRunning = false;
+
+async function runDisplayFix() {
+    if (displayFixRunning) return;
+    displayFixRunning = true;
+    if (trayPaths) buildMenu(trayPaths);
+    console.log('🖥 Fix displays — restarting DisplayLink Manager…');
+    try {
+        const result = await fixDisplays();
+        const body = result.error
+            ? result.error
+            : `${result.displays} of ${result.expected} displays connected`;
+        if (result.ok) console.log(`🖥 Fix displays complete: ${body}`);
+        else console.error(`🖥 Fix displays: ${body}`);
+        postDesktopNotification({
+            title: result.ok ? 'Displays fixed' : 'Displays still missing',
+            body: result.ok ? body : `${body}. Power-cycle the hub if this persists.`,
+        }).catch(() => {});
+    } finally {
+        displayFixRunning = false;
+        if (trayPaths) buildMenu(trayPaths);
     }
 }
 
@@ -2684,6 +2842,41 @@ function buildMenu(paths) {
         checked: phonePushState === true,
         enabled: haPushConfigured(),
         click: () => togglePhonePush().catch((err) => console.error('Toggle phone push:', err.message)),
+    });
+
+    items.push({
+        label: 'Auto-route audio',
+        type: 'checkbox',
+        checked: audioAutoRoute,
+        enabled: process.platform === 'darwin',
+        click: (item) => applyUiSettings({ audioAutoRoute: item.checked }),
+    });
+    items.push({
+        label: lastAudioRoute.name ? `Route audio now (${lastAudioRoute.name})` : 'Route audio now',
+        enabled: process.platform === 'darwin',
+        click: () => routeAudioNow({ notify: true }).catch((err) => log.audioError(err.message)),
+    });
+    items.push({
+        label: 'Keep Wave Link running',
+        type: 'checkbox',
+        checked: waveLinkKeepAlive,
+        enabled: process.platform === 'darwin',
+        click: (item) => applyUiSettings({ waveLinkKeepAlive: item.checked }),
+    });
+    const waveState = audioRouter?.waveLinkStatus();
+    if (waveState?.restarting) {
+        items.push({ label: 'Wave Link restarting…', enabled: false });
+    } else if (lastAudioRoute.waveLink === 'unreachable') {
+        items.push({
+            label: 'Wave Link not responding — restart now',
+            click: () => audioRouter?.restartWaveLink('not responding').catch((err) => log.audioError(err.message)),
+        });
+    }
+
+    items.push({
+        label: displayFixRunning ? 'Fixing displays…' : 'Fix displays',
+        enabled: process.platform === 'darwin' && !displayFixRunning,
+        click: () => runDisplayFix(),
     });
 
     items.push({ type: 'separator' });
@@ -3012,6 +3205,7 @@ app.whenReady().then(() => {
     createAlertPanelWindow();
     startPhonePushPolling();
     startPhonePushSubscription();
+    startAudioRouter();
     log.orbit('Started — use menu → Show console window to watch live activity');
 
     if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
@@ -3080,6 +3274,8 @@ function cleanup() {
     if (phonePushSubscription) phonePushSubscription.close();
     phonePushSubscription = null;
     notifier?.stop();
+    audioRouter?.stop();
+    audioRouter = null;
     stopTunnelHealthMonitor();
     stopCloudflareTunnel();
     if (webhookServer) {

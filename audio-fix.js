@@ -63,6 +63,21 @@ async function listAudioDevices(bin, type) {
     return out.split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
+async function listAudioDevicesJson(bin, type) {
+    const out = await runSwitchAudio(bin, ['-a', '-t', type, '-f', 'json']);
+    const devices = [];
+    for (const line of out.split('\n')) {
+        const s = line.trim();
+        if (!s) continue;
+        try {
+            devices.push(JSON.parse(s));
+        } catch {
+            // skip malformed lines
+        }
+    }
+    return devices;
+}
+
 async function getCurrentDevice(bin, type) {
     try {
         return await runSwitchAudio(bin, ['-c', '-t', type]);
@@ -174,6 +189,9 @@ module.exports = {
     config,
     resolveSwitchAudioSource,
     listAudioDevices,
+    listAudioDevicesJson,
+    getCurrentDevice,
+    setAudioDevice,
     isWaveLinkRunning,
     DEFAULTS,
 };

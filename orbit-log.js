@@ -17,4 +17,7 @@ module.exports = {
     clickup: (message, ...extra) => write('log', 'clickup', message, ...extra),
     clickupWarn: (message, ...extra) => write('warn', 'clickup', message, ...extra),
     clickupError: (message, ...extra) => write('error', 'clickup', message, ...extra),
+    audio: (message, ...extra) => write('log', 'audio', message, ...extra),
+    audioWarn: (message, ...extra) => write('warn', 'audio', message, ...extra),
+    audioError: (message, ...extra) => write('error', 'audio', message, ...extra),
 };
