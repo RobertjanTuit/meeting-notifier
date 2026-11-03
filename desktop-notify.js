@@ -1,6 +1,8 @@
 const { execFile } = require('child_process');
 const { Notification } = require('electron');
 const notifier = require('node-notifier');
+// Keep in sync with package.json build.appId; the packaged package.json has no build section.
+const BUNDLE_ID = 'com.rjtuit.orbit-app';
 
 const OSASCRIPT = '/usr/bin/osascript';
 const NOTIFIER_TIMEOUT_S = 20;
@@ -78,9 +80,9 @@ function showNodeNotifier({ title, body, subtitle, open, onClick }) {
             sound: false,
             open: open || undefined,
             wait: Boolean(onClick && !open),
-            appID: 'com.rjtuit.orbit',
+            appID: BUNDLE_ID,
             timeout: NOTIFIER_TIMEOUT_S,
-            sender: 'com.rjtuit.orbit',
+            sender: BUNDLE_ID,
         }, (err, response) => {
             if (err) {
                 settle(reject, err);
@@ -147,4 +149,4 @@ async function showDesktopNotification({ title, body, subtitle, open, onClick } 
     return { method: 'electron' };
 }
 
-module.exports = { showDesktopNotification, reapStaleNotifiers, etimeSeconds };
+module.exports = { BUNDLE_ID, showDesktopNotification, reapStaleNotifiers, etimeSeconds };

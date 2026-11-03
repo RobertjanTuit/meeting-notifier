@@ -36,7 +36,7 @@ const {
     checkPublicTunnelHealth,
 } = require('./cloudflare-tunnel.js');
 const log = require('./orbit-log.js');
-const { showDesktopNotification: postDesktopNotification, reapStaleNotifiers } = require('./desktop-notify.js');
+const { BUNDLE_ID, showDesktopNotification: postDesktopNotification, reapStaleNotifiers } = require('./desktop-notify.js');
 const { createSoundResolver } = require('./sound-resolver.js');
 
 let tray = null;
@@ -2201,7 +2201,7 @@ function repairMenuBarVisibility({ restartControlCenter = false } = {}) {
     if (process.platform !== 'darwin' || !app.isPackaged) return;
 
     const { execSync } = require('child_process');
-    const bundleId = require('./package.json').build?.appId || 'com.rjtuit.orbit';
+    const bundleId = BUNDLE_ID;
 
     const names = [ORBIT_TRAY_GUID, ...Array.from({ length: 8 }, (_, i) => `Item-${i}`)];
     for (const name of names) {
