@@ -2187,6 +2187,10 @@ function updateTrayIcon() {
     tray.setImage(trayImageForState());
 }
 
+// The tray's autosave name on macOS. Without it the item is the generic `Item-0`, which Tahoe
+// parked off-screen and whose saved visibility it wiped on every recreate (2026-11-03).
+const ORBIT_TRAY_GUID = 'ba9bd70f-7e83-482b-aeb2-5c0058c52594';
+
 /** macOS 26 Tahoe can allow an app in Menu Bar settings but still hide its NSStatusItem off-screen. */
 function repairMenuBarVisibility({ restartControlCenter = false } = {}) {
     if (process.platform !== 'darwin' || !app.isPackaged) return;
@@ -2194,8 +2198,9 @@ function repairMenuBarVisibility({ restartControlCenter = false } = {}) {
     const { execSync } = require('child_process');
     const bundleId = require('./package.json').build?.appId || 'com.rjtuit.orbit';
 
-    for (let i = 0; i < 8; i++) {
-        const key = `NSStatusItem VisibleCC Item-${i}`;
+    const names = [ORBIT_TRAY_GUID, ...Array.from({ length: 8 }, (_, i) => `Item-${i}`)];
+    for (const name of names) {
+        const key = `NSStatusItem VisibleCC ${name}`;
         try {
             const val = execSync(`defaults read ${bundleId} "${key}"`, { encoding: 'utf8' }).trim();
             if (val === '0' || val === 'false') {
@@ -2208,7 +2213,7 @@ function repairMenuBarVisibility({ restartControlCenter = false } = {}) {
     }
 
     try {
-        execSync(`defaults write ${bundleId} "NSStatusItem VisibleCC Item-0" -bool true`);
+        execSync(`defaults write ${bundleId} "NSStatusItem VisibleCC ${ORBIT_TRAY_GUID}" -bool true`);
     } catch (err) {
         console.warn('[menu-bar] could not write visibility default:', err.message);
     }
@@ -2231,7 +2236,7 @@ function createTray() {
     }
 
     lastTrayIconKey = null;
-    tray = new Tray(trayImageForState());
+    tray = new Tray(trayImageForState(), ORBIT_TRAY_GUID);
 
     tray.setToolTip(tooltip);
     tray.on('click', () => { if (alert.active) stopAlert(); });
@@ -3157,6 +3162,7 @@ app.whenReady().then(() => {
 
     const { OrbitNotifier } = require('./index.js');
 
+    repairMenuBarVisibility();
     createTray();
 
     if (process.platform === 'darwin' && app.dock && !dockShown) {
