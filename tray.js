@@ -644,10 +644,15 @@ function pushLog(level, args) {
         logWindow.webContents.send('log-line', { line: stamped, level });
     }
 }
+// A closed stdout pipe (the launching terminal went away) must not crash the app.
+const isBrokenPipe = (err) => err?.code === 'EPIPE' || err?.code === 'ERR_STREAM_DESTROYED';
+for (const stream of [process.stdout, process.stderr]) {
+    stream?.on?.('error', (err) => { if (!isBrokenPipe(err)) throw err; });
+}
 for (const method of ['log', 'info', 'warn', 'error']) {
     const original = console[method].bind(console);
     console[method] = (...args) => {
-        original(...args);
+        try { original(...args); } catch (err) { if (!isBrokenPipe(err)) throw err; }
         try { pushLog(method === 'info' ? 'log' : method, args); } catch { /* noop */ }
     };
 }
