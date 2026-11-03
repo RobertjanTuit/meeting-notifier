@@ -28,4 +28,9 @@ async function fixDisplays() {
     return { ok: displays >= EXPECTED_DISPLAYS, displays, expected: EXPECTED_DISPLAYS };
 }
 
-module.exports = { fixDisplays };
+/** True when every desk monitor is attached, i.e. the laptop is docked in the office. */
+async function isAtDesk() {
+    return (await countDisplays()) >= EXPECTED_DISPLAYS;
+}
+
+module.exports = { fixDisplays, countDisplays, isAtDesk, EXPECTED_DISPLAYS };

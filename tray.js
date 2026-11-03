@@ -17,7 +17,7 @@ const {
     pushEntityId,
 } = require('./push.js');
 const { fixAudio } = require('./audio-fix.js');
-const { fixDisplays } = require('./display-fix.js');
+const { fixDisplays, isAtDesk } = require('./display-fix.js');
 const { createElgatoCameraWatchdog } = require('./camera-fix.js');
 const {
     createAudioRouter,
@@ -3178,6 +3178,7 @@ app.whenReady().then(() => {
         soundPath: paths.soundPath,
     });
     notifier._resolveAlertSound = (source) => soundResolver.resolve(source);
+    notifier.lightsAllowed = isAtDesk;
     notifier.reinitializeSound();
     // Detect browser-based calls (Google Meet / Daily / Zoom web) in addition to
     // the native Zoom process, so lights/status reflect those too.

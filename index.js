@@ -57,6 +57,9 @@ class OrbitNotifier extends EventEmitter {
         this.scheduledNotifications = [];
         this.scheduledNotificationLogs = [];
         this.keyLights = [];
+        /** Async gate for automatic light changes; the tray skips them away from the desk. */
+        this.lightsAllowed = async () => true;
+        this._lightsSkipped = false;
         this._lightBaselines = this._loadLightBaselines();
         this.status = 'idle';
         this.lastError = null;
@@ -93,11 +96,29 @@ class OrbitNotifier extends EventEmitter {
 
     /** Keep Key Lights on while in a Zoom call; off when idle. */
     async _syncMeetingLights() {
+        if (!(await this._canUseLights())) return;
         if (this._zoomIsRunning) {
             await this.turnOnLights();
         } else {
             await this.turnOffLights();
         }
+    }
+
+    async _canUseLights() {
+        if (!this.keyLights.length) return false;
+        let allowed = true;
+        try {
+            allowed = await this.lightsAllowed();
+        } catch {
+            allowed = true;
+        }
+        if (allowed === this._lightsSkipped) {
+            this._lightsSkipped = !allowed;
+            console.log(chalk.gray(allowed
+                ? '💡 Desk monitors attached — Elgato lights back in use'
+                : '💡 Not at the desk — leaving Elgato lights alone'));
+        }
+        return allowed;
     }
 
     _loadLightBaselines() {
@@ -742,7 +763,7 @@ class OrbitNotifier extends EventEmitter {
         lights = true, sound = true, flash = true, soundSource = 'meetings',
     } = {}) {
         if (this.isBlinking) return;
-        const hasLights = lights && this.keyLights.length > 0;
+        const hasLights = lights && await this._canUseLights();
         const originalStates = {};
         if (hasLights) {
             for (const light of this.keyLights) {
